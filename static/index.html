@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solar Utility Bill Parser</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f8;
+      color: #1a202c;
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.6rem;
+      margin-bottom: 0.3rem;
+      color: #2d3748;
+    }
+
+    .subtitle {
+      text-align: center;
+      color: #718096;
+      margin-bottom: 2rem;
+      font-size: 0.9rem;
+    }
+
+    .upload-card {
+      background: white;
+      border-radius: 12px;
+      padding: 2rem;
+      max-width: 700px;
+      margin: 0 auto 2rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .drop-zone {
+      border: 2px dashed #cbd5e0;
+      border-radius: 8px;
+      padding: 2.5rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: #f6a623;
+      background: #fffbf2;
+    }
+
+    .drop-zone .icon { font-size: 2.5rem; margin-bottom: 0.5rem; }
+    .drop-zone p { color: #718096; font-size: 0.95rem; }
+    .drop-zone strong { color: #2d3748; }
+
+    #file-input { display: none; }
+
+    .file-list {
+      margin-top: 1rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .file-chip {
+      background: #edf2f7;
+      border-radius: 20px;
+      padding: 0.3rem 0.8rem;
+      font-size: 0.82rem;
+      color: #4a5568;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .file-chip .remove {
+      cursor: pointer;
+      color: #a0aec0;
+      font-weight: bold;
+      font-size: 1rem;
+      line-height: 1;
+    }
+    .file-chip .remove:hover { color: #e53e3e; }
+
+    .btn {
+      display: inline-block;
+      padding: 0.7rem 1.8rem;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-primary { background: #f6a623; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #e09410; }
+
+    .btn-copy { background: #48bb78; color: white; }
+    .btn-copy:hover { background: #38a169; }
+
+    .btn-download { background: #4299e1; color: white; }
+    .btn-download:hover { background: #3182ce; }
+
+    .actions {
+      margin-top: 1.2rem;
+      display: flex;
+      gap: 0.8rem;
+      flex-wrap: wrap;
+    }
+
+    .results-section {
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    .results-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .results-header h2 { font-size: 1.1rem; color: #2d3748; }
+
+    .table-wrap {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+
+    thead th {
+      background: #2d3748;
+      color: white;
+      padding: 0.75rem 1rem;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    thead th:first-child { border-radius: 12px 0 0 0; }
+    thead th:last-child { border-radius: 0 12px 0 0; }
+
+    tbody tr:nth-child(even) { background: #f7fafc; }
+    tbody tr:hover { background: #ebf8ff; }
+
+    tbody td {
+      padding: 0.65rem 1rem;
+      border-bottom: 1px solid #e2e8f0;
+      white-space: nowrap;
+    }
+
+    tbody td.empty { color: #a0aec0; font-style: italic; }
+
+    .status-bar {
+      text-align: center;
+      padding: 1.5rem;
+      color: #718096;
+      font-size: 0.9rem;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 20px; height: 20px;
+      border: 3px solid #e2e8f0;
+      border-top-color: #f6a623;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 0.5rem;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-box {
+      background: #fff5f5;
+      border: 1px solid #fed7d7;
+      border-radius: 8px;
+      padding: 1rem 1.2rem;
+      color: #c53030;
+      margin-top: 1rem;
+      font-size: 0.9rem;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      background: #2d3748;
+      color: white;
+      padding: 0.7rem 1.2rem;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+
+<h1>☀️ Solar Utility Bill Parser</h1>
+<p class="subtitle">Upload one PDF per billing month — extracts TOU usage &amp; charges automatically</p>
+
+<div class="upload-card">
+  <div class="drop-zone" id="drop-zone">
+    <div class="icon">📄</div>
+    <p><strong>Drag &amp; drop PDF files here</strong></p>
+    <p style="margin-top:0.3rem">or <span style="color:#f6a623;text-decoration:underline;cursor:pointer" onclick="document.getElementById('file-input').click()">browse to upload</span></p>
+  </div>
+  <input type="file" id="file-input" accept=".pdf" multiple />
+  <div class="file-list" id="file-list"></div>
+  <div id="upload-error"></div>
+  <div class="actions">
+    <button class="btn btn-primary" id="parse-btn" disabled onclick="submitFiles()">Parse Bills</button>
+  </div>
+</div>
+
+<div class="results-section" id="results-section" style="display:none">
+  <div class="results-header">
+    <h2 id="results-title">Extracted Data</h2>
+    <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
+      <button class="btn btn-copy" onclick="copyTable()">📋 Copy for Excel</button>
+      <button class="btn btn-download" onclick="downloadCSV()">⬇️ Download CSV</button>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table id="results-table">
+      <thead>
+        <tr>
+          <th>Month</th>
+          <th>Period Start</th>
+          <th>Period End</th>
+          <th>On Peak (kWh)</th>
+          <th>Mid Peak (kWh)</th>
+          <th>Off Peak (kWh)</th>
+          <th>Total (kWh)</th>
+          <th>Delivery Charge ($)</th>
+          <th>Regulatory Charge ($)</th>
+        </tr>
+      </thead>
+      <tbody id="results-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="status-bar" class="status-bar" style="display:none"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+  let selectedFiles = [];
+
+  // --- Drag & Drop ---
+  const dropZone = document.getElementById("drop-zone");
+  dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("drag-over"); });
+  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+  dropZone.addEventListener("drop", e => {
+    e.preventDefault();
+    dropZone.classList.remove("drag-over");
+    addFiles([...e.dataTransfer.files]);
+  });
+  dropZone.addEventListener("click", () => document.getElementById("file-input").click());
+
+  document.getElementById("file-input").addEventListener("change", e => {
+    addFiles([...e.target.files]);
+    e.target.value = "";
+  });
+
+  function addFiles(files) {
+    files.forEach(f => {
+      if (f.type === "application/pdf" && !selectedFiles.find(x => x.name === f.name)) {
+        selectedFiles.push(f);
+      }
+    });
+    renderFileList();
+  }
+
+  function removeFile(name) {
+    selectedFiles = selectedFiles.filter(f => f.name !== name);
+    renderFileList();
+  }
+
+  function renderFileList() {
+    const list = document.getElementById("file-list");
+    list.innerHTML = selectedFiles.map(f =>
+      `<div class="file-chip">📄 ${f.name} <span class="remove" onclick="removeFile('${f.name.replace(/'/g,"\\'")}')">×</span></div>`
+    ).join("");
+    document.getElementById("parse-btn").disabled = selectedFiles.length === 0;
+    document.getElementById("upload-error").innerHTML = "";
+  }
+
+  // --- Submit ---
+  async function submitFiles() {
+    if (!selectedFiles.length) return;
+
+    showStatus('<span class="spinner"></span> Parsing ' + selectedFiles.length + ' bill(s)...');
+    document.getElementById("parse-btn").disabled = true;
+    document.getElementById("results-section").style.display = "none";
+    document.getElementById("upload-error").innerHTML = "";
+
+    const fd = new FormData();
+    selectedFiles.forEach(f => fd.append("files", f));
+
+    try {
+      const res = await fetch("/upload", { method: "POST", body: fd });
+      const data = await res.json();
+
+      if (!res.ok || data.error) {
+        showError(data.error || "Server error");
+        return;
+      }
+
+      renderTable(data.rows);
+    } catch (e) {
+      showError("Could not connect to server: " + e.message);
+    } finally {
+      hideStatus();
+      document.getElementById("parse-btn").disabled = false;
+    }
+  }
+
+  // --- Table ---
+  function fmt(val, decimals = 0) {
+    if (val === null || val === undefined) return '<span class="empty">—</span>';
+    return Number(val).toLocaleString("en-US", {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
+    });
+  }
+
+  function renderTable(rows) {
+    const tbody = document.getElementById("results-body");
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td><strong>${r.billing_month}</strong>${r.billing_year ? " " + r.billing_year : ""}</td>
+        <td>${r.period_start || '<span class="empty">—</span>'}</td>
+        <td>${r.period_end || '<span class="empty">—</span>'}</td>
+        <td>${fmt(r.on_peak_kwh)}</td>
+        <td>${fmt(r.mid_peak_kwh)}</td>
+        <td>${fmt(r.off_peak_kwh)}</td>
+        <td>${fmt(r.total_kwh)}</td>
+        <td>${fmt(r.delivery_charge, 2)}</td>
+        <td>${fmt(r.regulatory_charge, 2)}</td>
+      </tr>
+    `).join("");
+
+    document.getElementById("results-title").textContent =
+      `Extracted Data — ${rows.length} month(s)`;
+    document.getElementById("results-section").style.display = "block";
+    document.getElementById("results-section").scrollIntoView({ behavior: "smooth" });
+  }
+
+  // --- Copy for Excel (tab-separated) ---
+  function copyTable() {
+    const headers = [
+      "Month", "Period Start", "Period End",
+      "On Peak (kWh)", "Mid Peak (kWh)", "Off Peak (kWh)", "Total (kWh)",
+      "Delivery Charge ($)", "Regulatory Charge ($)"
+    ];
+    const rows = [...document.querySelectorAll("#results-body tr")];
+    const lines = [headers.join("\t")];
+    rows.forEach(tr => {
+      const cells = [...tr.querySelectorAll("td")].map(td => td.textContent.trim().replace("—", ""));
+      lines.push(cells.join("\t"));
+    });
+    navigator.clipboard.writeText(lines.join("\n"))
+      .then(() => showToast("✅ Copied! Paste directly into Excel"))
+      .catch(() => showToast("❌ Copy failed — try the CSV download"));
+  }
+
+  // --- Download CSV ---
+  function downloadCSV() {
+    const headers = [
+      "Month", "Period Start", "Period End",
+      "On Peak (kWh)", "Mid Peak (kWh)", "Off Peak (kWh)", "Total (kWh)",
+      "Delivery Charge ($)", "Regulatory Charge ($)"
+    ];
+    const rows = [...document.querySelectorAll("#results-body tr")];
+    const lines = [headers.join(",")];
+    rows.forEach(tr => {
+      const cells = [...tr.querySelectorAll("td")].map(td => {
+        const v = td.textContent.trim().replace("—", "");
+        return v.includes(",") ? `"${v}"` : v;
+      });
+      lines.push(cells.join(","));
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "utility_data.csv";
+    a.click();
+  }
+
+  // --- Helpers ---
+  function showStatus(html) {
+    const bar = document.getElementById("status-bar");
+    bar.innerHTML = html;
+    bar.style.display = "block";
+  }
+
+  function hideStatus() {
+    document.getElementById("status-bar").style.display = "none";
+  }
+
+  function showError(msg) {
+    document.getElementById("upload-error").innerHTML =
+      `<div class="error-box">⚠️ ${msg}</div>`;
+    hideStatus();
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    setTimeout(() => t.classList.remove("show"), 2800);
+  }
+</script>
+</body>
+</html>

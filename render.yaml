@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: solar-utility-parser
+    runtime: python
+    buildCommand: apt-get install -y poppler-utils && pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: ANTHROPIC_API_KEY
+        sync: false
