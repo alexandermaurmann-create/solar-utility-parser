@@ -29,10 +29,10 @@ Extract ONLY these fields and return a single JSON object — no markdown, no ex
 }
 
 Rules:
-- on_peak_kwh = kWh used during On-Peak / Highest Price period
-- mid_peak_kwh = kWh used during Mid-Peak / Mid Price period
-- off_peak_kwh = kWh used during Off-Peak / Lowest Price period
-- total_kwh = total kWh used for the billing period (from meter reading table if available)
+- on_peak_kwh = the kWh QUANTITY used during On-Peak / Highest Price period. This is the large number before "kWh" on that line (e.g. "508.091 kWh On-peak" → 508.091). Do NOT use the dollar amount on the same line.
+- mid_peak_kwh = the kWh QUANTITY used during Mid-Peak / Mid Price period. Same rule — use the number before "kWh", not the dollar charge.
+- off_peak_kwh = the kWh QUANTITY used during Off-Peak / Lowest Price period. Same rule.
+- total_kwh = total kWh used for the billing period (from meter reading table if available, labeled "kWh Used")
 - delivery_charge = Delivery charge in dollars (number only, no $ sign)
 - regulatory_charge = Regulatory charge in dollars (number only, no $ sign)
 - billing_period_start/end = meter reading period start and end dates
