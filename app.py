@@ -6,6 +6,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from pdf2image import convert_from_path
+from PIL import Image, ImageEnhance, ImageFilter
 import anthropic
 
 app = Flask(__name__, static_folder="static")
@@ -47,54 +48,101 @@ Rules:
 - monthly_usage_history = ALL rows from the "Compare Your Daily Usage" bar chart/table (typically 13-15 months). Each entry has the read date and kWh value shown. Include every row you can find. Format dates as "DD MMM YY" (e.g. "20 MAR 26"). kWh values must be plain integers with NO commas or formatting (e.g. 3573 not 3,573).
 - ALL numeric values in this JSON must be plain numbers with NO commas, NO dollar signs, NO units — just digits and an optional decimal point.
 - If a field is not found, use null. For monthly_usage_history use empty array [] if not found.
+
+IMPORTANT — digit accuracy:
+- Read every digit carefully. Common OCR mistakes to avoid: 6 vs 8, 1 vs 7, 5 vs 6, 0 vs 8, 3 vs 8.
+- For kWh values in the 2,000–4,000 range, the second digit after the comma is critical — double-check it.
+- After extracting all values, mentally verify each number makes sense in context (e.g. monthly kWh usage for a home is typically between 500–5000).
 - Return ONLY the JSON object, nothing else
 """
 
-def pdf_to_images_b64(pdf_path):
-    """Convert PDF pages to base64-encoded PNG images."""
-    images = convert_from_path(pdf_path, dpi=300)
-    result = []
-    for img in images:
+VERIFY_PROMPT = """You previously extracted this data from a utility bill image:
+
+{data}
+
+Please re-read the image carefully and verify every number. Pay special attention to digits that look similar: 6 vs 8, 1 vs 7, 5 vs 6, 0 vs 8.
+
+Return the corrected JSON object with the same structure. If a value was correct, keep it. If you spot an error, fix it. Return ONLY the JSON object, no other text.
+"""
+
+def enhance_image(img):
+    """Boost contrast and sharpness to improve OCR accuracy."""
+    # Convert to RGB if needed
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    # Sharpen
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.filter(ImageFilter.SHARPEN)
+    # Boost contrast
+    img = ImageEnhance.Contrast(img).enhance(1.8)
+    # Boost sharpness
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+    # Slight brightness boost for dark/faded images
+    img = ImageEnhance.Brightness(img).enhance(1.1)
+    return img
+
+def file_to_images_b64(file_path):
+    """Convert a PDF or PNG file to a list of enhanced base64-encoded PNG images."""
+    if file_path.lower().endswith(".png"):
+        img = Image.open(file_path)
+        img = enhance_image(img)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        result.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
-    return result
+        return [base64.standard_b64encode(buf.getvalue()).decode("utf-8")]
+    else:
+        images = convert_from_path(file_path, dpi=300)
+        result = []
+        for img in images:
+            img = enhance_image(img)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            result.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
+        return result
+
+def clean_json(raw):
+    """Strip markdown fences and parse JSON."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    return json.loads(raw)
 
 def extract_with_claude(images_b64):
-    """Send PDF page images to Claude and extract structured bill data."""
+    """Send images to Claude, extract data, then do a verification pass."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    content = []
-    for img_b64 in images_b64:
-        content.append({
+    image_content = [
+        {
             "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": img_b64
-            }
-        })
-    content.append({"type": "text", "text": EXTRACT_PROMPT})
+            "source": {"type": "base64", "media_type": "image/png", "data": b64}
+        }
+        for b64 in images_b64
+    ]
 
-    response = client.messages.create(
+    # Pass 1: initial extraction
+    response1 = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
-        messages=[{"role": "user", "content": content}]
+        messages=[{"role": "user", "content": image_content + [{"type": "text", "text": EXTRACT_PROMPT}]}]
     )
+    data = clean_json(response1.content[0].text)
 
-    raw = response.content[0].text.strip()
+    # Pass 2: verification — re-read the image and check every number
+    verify_prompt = VERIFY_PROMPT.format(data=json.dumps(data, indent=2))
+    response2 = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": image_content + [{"type": "text", "text": verify_prompt}]}]
+    )
+    verified = clean_json(response2.content[0].text)
 
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    return json.loads(raw)
+    return verified
 
 def parse_history_date(date_str):
     """Parse '20 MAR 26' or '20 MAR 2026' → (year, month_index 0-11)."""
@@ -166,14 +214,15 @@ def upload():
     bills = []
 
     for f in files:
-        if not f.filename.lower().endswith(".pdf"):
+        ext = f.filename.lower().split(".")[-1]
+        if ext not in ("pdf", "png"):
             continue
 
         tmp_path = f"/tmp/{f.filename}"
         f.save(tmp_path)
 
         try:
-            images_b64 = pdf_to_images_b64(tmp_path)
+            images_b64 = file_to_images_b64(tmp_path)
             data = extract_with_claude(images_b64)
         except ValueError as e:
             return jsonify({"error": str(e)}), 500
@@ -202,7 +251,7 @@ def upload():
         })
 
     if not bills:
-        return jsonify({"error": "No valid PDF files found"}), 400
+        return jsonify({"error": "No valid PDF or PNG files found"}), 400
 
     rows = build_sorted_rows(bills)
     return jsonify({"rows": rows})

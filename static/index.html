@@ -220,10 +220,10 @@
 <div class="upload-card">
   <div class="drop-zone" id="drop-zone">
     <div class="icon">📄</div>
-    <p><strong>Drag &amp; drop PDF files here</strong></p>
-    <p style="margin-top:0.3rem">or <span style="color:#f6a623;text-decoration:underline;cursor:pointer" onclick="document.getElementById('file-input').click()">browse to upload</span></p>
+    <p><strong>Drag &amp; drop PDF or PNG files here</strong></p>
+    <p style="margin-top:0.3rem">or <span style="color:#f6a623;text-decoration:underline;cursor:pointer">browse to upload</span></p>
   </div>
-  <input type="file" id="file-input" accept=".pdf" multiple />
+  <input type="file" id="file-input" accept=".pdf,.png" multiple />
   <div class="file-list" id="file-list"></div>
   <div id="upload-error"></div>
   <div class="actions">
@@ -306,7 +306,7 @@
 
   function addFiles(files) {
     files.forEach(f => {
-      if (f.type === "application/pdf" && !selectedFiles.find(x => x.name === f.name)) {
+      if (["application/pdf", "image/png"].includes(f.type) && !selectedFiles.find(x => x.name === f.name)) {
         selectedFiles.push(f);
       }
     });
