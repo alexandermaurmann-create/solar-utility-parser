@@ -3,7 +3,7 @@ services:
     name: solar-utility-parser
     runtime: python
     buildCommand: apt-get install -y poppler-utils && pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --timeout 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
