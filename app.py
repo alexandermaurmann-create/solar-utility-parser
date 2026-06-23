@@ -3,13 +3,14 @@ import io
 import json
 import base64
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
 from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageFilter
 import anthropic
 
 app = Flask(__name__, static_folder="static")
+app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
 CORS(app)
 
 MONTH_ORDER = ["January", "February", "March", "April", "May", "June",
@@ -201,12 +202,71 @@ def build_sorted_rows(bills):
     recent.sort(key=lambda b: MONTH_ORDER.index(b["billing_month"]))
     return recent + unknown
 
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Login — Solar Utility Parser</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           background: #f0f4f8; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; }
+    .card { background: white; border-radius: 12px; padding: 2.5rem 2rem;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.1); width: 100%; max-width: 360px; }
+    h1 { font-size: 1.4rem; text-align: center; margin-bottom: 0.3rem; color: #2d3748; }
+    p { text-align: center; color: #718096; font-size: 0.9rem; margin-bottom: 1.8rem; }
+    input { width: 100%; padding: 0.75rem 1rem; border: 1px solid #e2e8f0;
+            border-radius: 8px; font-size: 1rem; margin-bottom: 1rem; outline: none; }
+    input:focus { border-color: #f6a623; }
+    button { width: 100%; padding: 0.75rem; background: #f6a623; color: white;
+             border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    button:hover { background: #e09410; }
+    .error { color: #c53030; font-size: 0.88rem; text-align: center; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>☀️ Solar Utility Parser</h1>
+    <p>Enter the password to continue</p>
+    {error}
+    <form method="POST" action="/login">
+      <input type="password" name="password" placeholder="Password" autofocus />
+      <button type="submit">Sign In</button>
+    </form>
+  </div>
+</body>
+</html>"""
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if password == os.environ.get("APP_PASSWORD", "solar123"):
+            session["authenticated"] = True
+            return redirect(url_for("index"))
+        return LOGIN_HTML.replace("{error}", '<p class="error">Incorrect password</p>'), 401
+    return LOGIN_HTML.replace("{error}", "")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+def require_auth():
+    return not session.get("authenticated")
+
 @app.route("/")
 def index():
+    if require_auth():
+        return redirect(url_for("login"))
     return send_from_directory("static", "index.html")
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    if require_auth():
+        return jsonify({"error": "Unauthorized"}), 401
     if "files" not in request.files:
         return jsonify({"error": "No files provided"}), 400
 

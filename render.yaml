@@ -9,3 +9,7 @@ services:
         value: 3.11.0
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        sync: false
