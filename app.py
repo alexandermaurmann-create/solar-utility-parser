@@ -21,14 +21,23 @@ MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 EXTRACT_PROMPT = """You are extracting data from a utility electricity bill.
 
+First, identify the bill type:
+- "TOU" = Time-of-Use: has On-peak, Mid-peak, Off-peak charges
+- "ULO" = Ultra-Low Overnight: has On-peak, Mid-peak, Off-peak AND Overnight charges
+- "Tiered" = Tiered Rate: has Lower Tier and Higher Tier charges (no on/mid/off peak)
+
 Extract ONLY these fields and return a single JSON object — no markdown, no extra text:
 
 {
+  "bill_type": "TOU" or "ULO" or "Tiered",
   "billing_period_start": "MM/DD/YYYY or null",
   "billing_period_end": "MM/DD/YYYY or null",
   "on_peak_kwh": number or null,
   "mid_peak_kwh": number or null,
   "off_peak_kwh": number or null,
+  "overnight_kwh": number or null,
+  "tier1_kwh": number or null,
+  "tier2_kwh": number or null,
   "total_kwh": number or null,
   "delivery_charge": number or null,
   "regulatory_charge": number or null,
@@ -39,21 +48,25 @@ Extract ONLY these fields and return a single JSON object — no markdown, no ex
 }
 
 Rules:
-- on_peak_kwh = the kWh QUANTITY used during On-Peak / Highest Price period. This is the large number before "kWh" on that line (e.g. "508.091 kWh On-peak" → 508.091). Do NOT use the dollar amount on the same line.
-- mid_peak_kwh = the kWh QUANTITY used during Mid-Peak / Mid Price period. Same rule — use the number before "kWh", not the dollar charge.
-- off_peak_kwh = the kWh QUANTITY used during Off-Peak / Lowest Price period. Same rule.
-- total_kwh = total kWh used for the billing period (from meter reading table if available, labeled "kWh Used")
+- bill_type: detect from the electricity charges section. If it says "On-peak/Mid-peak/Off-peak" it's TOU or ULO. If it also has "Overnight" it's ULO. If it says "Lower Tier/Higher Tier" it's Tiered.
+- on_peak_kwh = kWh QUANTITY for On-Peak / Highest Price (TOU and ULO only). Use the number BEFORE "kWh" on that line, NOT the dollar amount.
+- mid_peak_kwh = kWh QUANTITY for Mid-Peak / Mid Price (TOU and ULO only). Same rule.
+- off_peak_kwh = kWh QUANTITY for Off-Peak / Lowest Price (TOU and ULO only). Same rule.
+- overnight_kwh = kWh QUANTITY for Overnight period (ULO only). Ignore any negative/credit entries — only use positive consumption values.
+- tier1_kwh = SUM of ALL Lower Tier kWh entries (Tiered only). There may be 2 rows if billing crossed a rate change date — add them together.
+- tier2_kwh = SUM of ALL Higher Tier kWh entries (Tiered only). Same — add all Higher Tier rows together.
+- total_kwh = total kWh used for the billing period (from meter reading table, labeled "kWh Used")
 - delivery_charge = Delivery charge in dollars (number only, no $ sign)
 - regulatory_charge = Regulatory charge in dollars (number only, no $ sign)
 - billing_period_start/end = meter reading period start and end dates
-- monthly_usage_history = ALL rows from the "Compare Your Daily Usage" bar chart/table (typically 13-15 months). Each entry has the read date and kWh value shown. Include every row you can find. Format dates as "DD MMM YY" (e.g. "20 MAR 26"). kWh values must be plain integers with NO commas or formatting (e.g. 3573 not 3,573).
-- ALL numeric values in this JSON must be plain numbers with NO commas, NO dollar signs, NO units — just digits and an optional decimal point.
-- If a field is not found, use null. For monthly_usage_history use empty array [] if not found.
+- monthly_usage_history = ALL rows from the "Compare Your Daily Usage" bar chart/table (typically 13-15 months). Format dates as "DD MMM YY" (e.g. "20 MAR 26"). kWh values as plain integers.
+- For fields that don't apply to the detected bill type, use null.
+- ALL numeric values must be plain numbers — NO commas, NO dollar signs, NO units.
+- If a field is not found, use null. For monthly_usage_history use [] if not found.
 
 IMPORTANT — digit accuracy:
-- Read every digit carefully. Common OCR mistakes to avoid: 6 vs 8, 1 vs 7, 5 vs 6, 0 vs 8, 3 vs 8.
-- For kWh values in the 2,000–4,000 range, the second digit after the comma is critical — double-check it.
-- After extracting all values, mentally verify each number makes sense in context (e.g. monthly kWh usage for a home is typically between 500–5000).
+- Read every digit carefully. Common mistakes: 6 vs 8, 1 vs 7, 5 vs 6, 0 vs 8, 3 vs 8.
+- Monthly kWh values for a home are typically between 500–5000 — verify values make sense.
 - Return ONLY the JSON object, nothing else
 """
 
@@ -297,6 +310,7 @@ def upload():
 
         bills.append({
             "filename": f.filename,
+            "bill_type": data.get("bill_type", "TOU"),
             "billing_month": month or "Unknown",
             "billing_year": year or 0,
             "period_start": data.get("billing_period_start") or "",
@@ -304,6 +318,9 @@ def upload():
             "on_peak_kwh": data.get("on_peak_kwh"),
             "mid_peak_kwh": data.get("mid_peak_kwh"),
             "off_peak_kwh": data.get("off_peak_kwh"),
+            "overnight_kwh": data.get("overnight_kwh"),
+            "tier1_kwh": data.get("tier1_kwh"),
+            "tier2_kwh": data.get("tier2_kwh"),
             "total_kwh": data.get("total_kwh"),
             "delivery_charge": data.get("delivery_charge"),
             "regulatory_charge": data.get("regulatory_charge"),
