@@ -354,30 +354,23 @@
     });
   }
 
-  // Determine which columns to show based on bill types present
+  // All columns always shown for consistent copy/paste into Excel
   function getColumns(rows) {
-    const types = [...new Set(rows.map(r => r.bill_type || "TOU"))];
-    const hasTOU    = types.some(t => t === "TOU");
-    const hasULO    = types.some(t => t === "ULO");
-    const hasTiered = types.some(t => t === "Tiered");
-    const showTOU   = hasTOU || hasULO;  // TOU cols used by both TOU and ULO
-
-    const cols = [
-      { key: "month",            label: "Month",               always: true },
-      { key: "bill_type",        label: "Bill Type",           always: types.length > 1 || true },
-      { key: "period_start",     label: "Period Start",        always: true },
-      { key: "period_end",       label: "Period End",          always: true },
-      { key: "on_peak_kwh",      label: "On Peak (kWh)",       show: showTOU },
-      { key: "mid_peak_kwh",     label: "Mid Peak (kWh)",      show: showTOU },
-      { key: "off_peak_kwh",     label: "Off Peak (kWh)",      show: showTOU },
-      { key: "overnight_kwh",    label: "Overnight (kWh)",     show: hasULO },
-      { key: "tier1_kwh",        label: "Lower Tier (kWh)",    show: hasTiered },
-      { key: "tier2_kwh",        label: "Higher Tier (kWh)",   show: hasTiered },
-      { key: "total_kwh",        label: "Total (kWh)",         always: true },
-      { key: "delivery_charge",  label: "Delivery Charge ($)", always: true },
-      { key: "regulatory_charge",label: "Regulatory Charge ($)",always: true },
+    return [
+      { key: "month",             label: "Month" },
+      { key: "bill_type",         label: "Bill Type" },
+      { key: "period_start",      label: "Period Start" },
+      { key: "period_end",        label: "Period End" },
+      { key: "on_peak_kwh",       label: "On Peak (kWh)" },
+      { key: "mid_peak_kwh",      label: "Mid Peak (kWh)" },
+      { key: "off_peak_kwh",      label: "Off Peak (kWh)" },
+      { key: "overnight_kwh",     label: "Overnight (kWh)" },
+      { key: "tier1_kwh",         label: "Lower Tier (kWh)" },
+      { key: "tier2_kwh",         label: "Higher Tier (kWh)" },
+      { key: "total_kwh",         label: "Total (kWh)" },
+      { key: "delivery_charge",   label: "Delivery Charge ($)" },
+      { key: "regulatory_charge", label: "Regulatory Charge ($)" },
     ];
-    return cols.filter(c => c.always || c.show);
   }
 
   let currentColumns = [];
