@@ -44,14 +44,15 @@ Rules:
 - delivery_charge = Delivery charge in dollars (number only, no $ sign)
 - regulatory_charge = Regulatory charge in dollars (number only, no $ sign)
 - billing_period_start/end = meter reading period start and end dates
-- monthly_usage_history = ALL rows from the "Compare Your Daily Usage" bar chart/table (typically 13-15 months). Each entry has the read date and kWh value shown. Include every row you can find. Format dates as "DD MMM YY" (e.g. "20 MAR 26"). kWh values are numbers only.
+- monthly_usage_history = ALL rows from the "Compare Your Daily Usage" bar chart/table (typically 13-15 months). Each entry has the read date and kWh value shown. Include every row you can find. Format dates as "DD MMM YY" (e.g. "20 MAR 26"). kWh values must be plain integers with NO commas or formatting (e.g. 3573 not 3,573).
+- ALL numeric values in this JSON must be plain numbers with NO commas, NO dollar signs, NO units — just digits and an optional decimal point.
 - If a field is not found, use null. For monthly_usage_history use empty array [] if not found.
 - Return ONLY the JSON object, nothing else
 """
 
 def pdf_to_images_b64(pdf_path):
     """Convert PDF pages to base64-encoded PNG images."""
-    images = convert_from_path(pdf_path, dpi=200)
+    images = convert_from_path(pdf_path, dpi=300)
     result = []
     for img in images:
         buf = io.BytesIO()
@@ -80,7 +81,7 @@ def extract_with_claude(images_b64):
     content.append({"type": "text", "text": EXTRACT_PROMPT})
 
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-6",
         max_tokens=1024,
         messages=[{"role": "user", "content": content}]
     )
