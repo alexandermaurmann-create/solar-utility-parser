@@ -232,6 +232,8 @@
 </div>
 
 <div class="results-section" id="results-section" style="display:none">
+
+  <!-- TOU Detail Table -->
   <div class="results-header">
     <h2 id="results-title">Extracted Data</h2>
     <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
@@ -257,6 +259,27 @@
       <tbody id="results-body"></tbody>
     </table>
   </div>
+
+  <!-- Monthly kWh History Table -->
+  <div class="results-header" id="history-header" style="display:none;margin-top:2rem">
+    <h2>Monthly kWh Usage — Last 12 Months</h2>
+    <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
+      <button class="btn btn-copy" onclick="copyHistory()">📋 Copy for Excel</button>
+      <button class="btn btn-download" onclick="downloadHistoryCSV()">⬇️ Download CSV</button>
+    </div>
+  </div>
+  <div class="table-wrap" id="history-wrap" style="display:none;max-width:300px">
+    <table>
+      <thead>
+        <tr>
+          <th>Month</th>
+          <th>kWh</th>
+        </tr>
+      </thead>
+      <tbody id="history-body"></tbody>
+    </table>
+  </div>
+
 </div>
 
 <div id="status-bar" class="status-bar" style="display:none"></div>
@@ -361,8 +384,30 @@
 
     document.getElementById("results-title").textContent =
       `Extracted Data — ${rows.length} month(s)`;
+
+    // Build history from first bill that has data
+    const historyRow = rows.find(r => r.monthly_history && r.monthly_history.length > 0);
+    if (historyRow) {
+      renderHistory(historyRow.monthly_history);
+    }
+
     document.getElementById("results-section").style.display = "block";
     document.getElementById("results-section").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function renderHistory(history) {
+    const tbody = document.getElementById("history-body");
+    let total = 0;
+    tbody.innerHTML = history.map(h => {
+      total += h.kwh || 0;
+      return `<tr><td>${h.month_abbr}</td><td>${fmt(h.kwh)}</td></tr>`;
+    }).join("");
+    // Total row
+    tbody.innerHTML += `<tr style="font-weight:600;border-top:2px solid #2d3748">
+      <td>Total</td><td>${fmt(total)}</td>
+    </tr>`;
+    document.getElementById("history-header").style.display = "flex";
+    document.getElementById("history-wrap").style.display = "block";
   }
 
   // --- Copy for Excel (tab-separated) ---
@@ -403,6 +448,33 @@
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "utility_data.csv";
+    a.click();
+  }
+
+  // --- History copy/download ---
+  function copyHistory() {
+    const rows = [...document.querySelectorAll("#history-body tr")];
+    const lines = ["Month\tkWh"];
+    rows.forEach(tr => {
+      const cells = [...tr.querySelectorAll("td")].map(td => td.textContent.trim().replace("—", ""));
+      lines.push(cells.join("\t"));
+    });
+    navigator.clipboard.writeText(lines.join("\n"))
+      .then(() => showToast("✅ Copied! Paste directly into Excel"))
+      .catch(() => showToast("❌ Copy failed — try the CSV download"));
+  }
+
+  function downloadHistoryCSV() {
+    const rows = [...document.querySelectorAll("#history-body tr")];
+    const lines = ["Month,kWh"];
+    rows.forEach(tr => {
+      const cells = [...tr.querySelectorAll("td")].map(td => td.textContent.trim().replace("—", ""));
+      lines.push(cells.join(","));
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "monthly_kwh_history.csv";
     a.click();
   }
 
