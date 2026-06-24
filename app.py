@@ -4,6 +4,7 @@ import re
 import json
 import base64
 import uuid
+from itertools import combinations
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
@@ -235,6 +236,8 @@ def pixel_extract_bars(pil_image, meta):
         gl_candidates   = []
         row_to_kwh      = None
 
+        all_gray_cands = []   # saved for plot area + partial calibration fallback
+
         if gl_values and len(gl_values) >= 2:
             orig_arr = np.array(chart_orig_pil)
             ro = orig_arr[:, :, 0].astype(float)
@@ -251,6 +254,8 @@ def pixel_extract_bars(pil_image, meta):
                 cands = cluster_rows(np.where(gray_cov_o > gl_thresh)[0], gap=3)
                 print(f"[pixel] gridline thresh={gl_thresh}: {len(cands)} candidates "
                       f"(need {len(gl_values)}): rows={[round(c) for c in cands]}")
+                if not all_gray_cands and len(cands) >= 2:
+                    all_gray_cands = cands   # save first result for fallbacks
                 if len(cands) == len(gl_values):
                     gl_candidates = cands
                     gl_px   = np.array([row * SCALE for row in gl_candidates], dtype=float)
@@ -260,7 +265,37 @@ def pixel_extract_bars(pil_image, meta):
                     print(f"[pixel] gridline calibration OK slope={coeffs[0]:.4f} intercept={coeffs[1]:.1f}")
                     break
 
-            if row_to_kwh is None:
+            # --- PARTIAL GRIDLINE CALIBRATION ---
+            # If exact count didn't match, search all combinations of detected rows
+            # vs expected kWh values for the best linear fit.
+            if row_to_kwh is None and len(all_gray_cands) >= 3:
+                residual_thresh = max(40.0, 0.06 * (y_max - y_min))
+                best_res, best_coeffs, best_cands = float('inf'), None, None
+                sorted_cands = sorted(all_gray_cands)
+                # Try largest subsets first (most constrained fit)
+                for sz in range(min(7, len(sorted_cands)), 2, -1):
+                    for cand_sub in combinations(sorted_cands, sz):
+                        px_sub = np.array([row * SCALE for row in cand_sub], dtype=float)
+                        for val_sub in combinations(gl_values, sz):
+                            v = np.array(val_sub, dtype=float)
+                            if v.max() == v.min():
+                                continue
+                            c = np.polyfit(px_sub, v, 1)
+                            res = np.abs(np.polyval(c, px_sub) - v).max()
+                            if res < best_res:
+                                best_res, best_coeffs, best_cands = res, c, cand_sub
+                    if best_res < residual_thresh:
+                        break   # good enough — stop trying smaller subsets
+
+                if best_res < residual_thresh and best_coeffs is not None:
+                    gl_candidates = list(best_cands)
+                    row_to_kwh = lambda row, c=best_coeffs: float(np.polyval(c, row))
+                    print(f"[pixel] partial gridline fit: {len(best_cands)} rows, "
+                          f"slope={best_coeffs[0]:.4f}, max_residual={best_res:.1f}")
+                else:
+                    print(f"[pixel] gridline calibration failed (best residual={best_res:.1f}) "
+                          f"— falling back to floor detection")
+            elif row_to_kwh is None:
                 print("[pixel] gridline calibration failed — falling back to floor detection")
 
         # --- MASK BAR DETECTION TO CHART PLOT AREA ---
@@ -269,6 +304,17 @@ def pixel_extract_bars(pil_image, meta):
         if gl_candidates:
             plot_top = max(0, int(gl_candidates[0]  * SCALE) - SCALE * 3)
             plot_bot = min(ch, int(gl_candidates[-1] * SCALE) + SCALE * 5)
+        elif all_gray_cands:
+            # Calibration failed but we have gray row hints — skip chart header rows
+            # (top 8% of chart height are usually title/border, not gridlines)
+            skip_orig = max(1, int(orig_ch * 0.08))
+            useful = [c for c in all_gray_cands if c > skip_orig]
+            if len(useful) >= 2:
+                plot_top = max(0, int(useful[0] * SCALE) + SCALE)
+                plot_bot = min(ch, int(useful[-1] * SCALE) + SCALE * 5)
+            else:
+                plot_top = 0
+                plot_bot = ch
         else:
             plot_top = 0
             plot_bot = ch
@@ -303,22 +349,19 @@ def pixel_extract_bars(pil_image, meta):
 
         # --- 3. FALLBACK: X-AXIS LINE + BAR FLOOR DETECTION ---
         if row_to_kwh is None:
-            all_bar_rows = np.where(is_bar.any(axis=1))[0]
-            bar_floor = int(all_bar_rows.max()) + 1 if len(all_bar_rows) > 0 else ch
-
             is_dark = brightness < 450
             dark_cov = is_dark.mean(axis=1)
             dark_rows = np.where(dark_cov > 0.30)[0]
-            if len(dark_rows) > 0:
-                below = dark_rows[dark_rows >= bar_floor - SCALE * 8]
-                chart_floor = int(below.min()) if len(below) > 0 else bar_floor
-            else:
-                chart_floor = bar_floor
 
-            eff_height = max(1, chart_floor)
-            row_to_kwh = lambda row, f=eff_height, ymn=y_min, ymx=y_max: \
-                ymx - (row / f) * (ymx - ymn)
-            print(f"[pixel] floor calibration: floor={chart_floor}px height={eff_height}px")
+            # Find x-axis line near/below the plot area
+            below = dark_rows[dark_rows >= plot_bot - SCALE * 8] if len(dark_rows) > 0 else []
+            chart_floor = int(below.min()) if len(below) > 0 else plot_bot
+
+            # Calibrate: plot_top row = y_max, chart_floor row = y_min
+            eff_height = max(1, chart_floor - plot_top)
+            row_to_kwh = lambda row, t=float(plot_top), h=float(eff_height), \
+                ymn=y_min, ymx=y_max: ymx - ((row - t) / h) * (ymx - ymn)
+            print(f"[pixel] floor calibration: plot_top={plot_top}, floor={chart_floor}, height={eff_height}px")
 
         # --- BAR X-POSITION DETECTION ---
         # Detect actual bar pixel region, then equal-space within it.
