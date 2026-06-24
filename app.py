@@ -1,7 +1,9 @@
 import os
 import io
+import re
 import json
 import base64
+import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
@@ -636,32 +638,65 @@ def upload():
         return jsonify({"error": "No files provided"}), 400
 
     files = request.files.getlist("files")
-    bills = []
+
+    # Group files into bills:
+    #   - Each PDF is its own bill (already multi-page internally).
+    #   - PNGs sharing the same filename prefix (digits stripped from the end)
+    #     are treated as pages of one bill, e.g. "hydro1.png" + "hydro2.png"
+    #     → one bill. "jan.png" + "feb.png" → two bills (different prefixes).
+    groups = {}  # key → list of FileStorage objects, preserving upload order
+    group_order = []
 
     for f in files:
-        ext = f.filename.lower().split(".")[-1]
+        ext = f.filename.lower().rsplit(".", 1)[-1]
         if ext not in ("pdf", "png"):
             continue
+        if ext == "pdf":
+            key = f.filename          # PDFs never share a group
+        else:
+            base = f.filename.rsplit(".", 1)[0]
+            key = re.sub(r"\d+$", "", base) or base   # strip trailing digits
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(f)
 
-        tmp_path = f"/tmp/{f.filename}"
-        f.save(tmp_path)
+    bills = []
+
+    for key in group_order:
+        group_files = groups[key]
+        all_pil, all_b64, tmp_paths = [], [], []
+
+        for f in group_files:
+            tmp_path = f"/tmp/{uuid.uuid4().hex}_{f.filename}"
+            f.save(tmp_path)
+            tmp_paths.append(tmp_path)
+            pil_images, images_b64 = file_to_images(tmp_path)
+            all_pil.extend(pil_images)
+            all_b64.extend(images_b64)
 
         try:
-            pil_images, images_b64 = file_to_images(tmp_path)
-            data = extract_with_claude(images_b64, pil_images)
+            data = extract_with_claude(all_b64, all_pil)
         except ValueError as e:
             return jsonify({"error": str(e)}), 500
         except Exception as e:
-            return jsonify({"error": f"Failed to process {f.filename}: {str(e)}"}), 500
+            label = group_files[0].filename
+            return jsonify({"error": f"Failed to process {label}: {str(e)}"}), 500
         finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            for p in tmp_paths:
+                if os.path.exists(p):
+                    os.remove(p)
 
         month, year = month_from_date(data.get("billing_period_end"))
         monthly_history = build_monthly_history(data.get("monthly_usage_history") or [])
 
+        if len(group_files) == 1:
+            display_name = group_files[0].filename
+        else:
+            display_name = f"{group_files[0].filename} (+{len(group_files)-1} page{'s' if len(group_files)>2 else ''})"
+
         bills.append({
-            "filename": f.filename,
+            "filename": display_name,
             "bill_type": data.get("bill_type", "TOU"),
             "billing_month": month or "Unknown",
             "billing_year": year or 0,
