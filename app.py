@@ -211,17 +211,6 @@ def pixel_extract_bars(pil_image, meta):
         month_labels = meta.get("month_labels", [])
         bar_count    = meta.get("bar_count")
         gl_values    = meta.get("y_axis_gridlines") or []
-
-        # Strip fabricated top gridline: if gl_values[0] exceeds y_axis_max, drop it.
-        # Claude sometimes adds an extra value above the actual chart top (e.g. 800
-        # when Burlington's axis only goes to 700), causing need=N+1 and wrong calibration.
-        if gl_values and len(gl_values) >= 2:
-            step = abs(gl_values[0] - gl_values[1])
-            if step > 0 and gl_values[0] > y_max + step * 0.5:
-                print(f"[pixel] dropping fabricated top gridline {gl_values[0]} "
-                      f"(y_axis_max={y_max})")
-                gl_values = gl_values[1:]
-
         bar_color    = meta.get("bar_color_rgb")
         chart_total  = meta.get("chart_total_kwh")
 
@@ -266,6 +255,11 @@ def pixel_extract_bars(pil_image, meta):
             return clusters
 
         # --- GRIDLINE-BASED Y CALIBRATION ---
+        # Detect gridlines in the FULL bill image (restricted to chart columns),
+        # with a generous row window that extends 5px above and 30px below Claude's
+        # crop.  Using absolute pixel coordinates means the calibration is stable
+        # regardless of how much chart_*_pct drifts between Claude runs — the
+        # gridlines are always at the same absolute positions in the original image.
         bar_centers_pct = meta.get("bar_centers_pct") or []
         gl_candidates   = []
         row_to_kwh      = None
@@ -283,6 +277,11 @@ def pixel_extract_bars(pil_image, meta):
 
             print(f"[pixel] gridline coverage: max={gray_cov_o.max():.3f} mean={gray_cov_o.mean():.3f}")
 
+            # Use absolute image coordinates for calibration so the slope is
+            # crop-offset-independent: gl_px uses (crop_row + top)*SCALE and
+            # row_to_kwh adds top*SCALE to convert the crop-zoomed bar_top to absolute.
+            abs_off = top * SCALE  # zoomed pixels from image top to crop top
+
             for gl_thresh in [0.50, 0.40, 0.30, 0.20, 0.12]:
                 cands = cluster_rows(np.where(gray_cov_o > gl_thresh)[0], gap=3, weights=gray_cov_o)
                 print(f"[pixel] gridline thresh={gl_thresh}: {len(cands)} candidates "
@@ -291,12 +290,16 @@ def pixel_extract_bars(pil_image, meta):
                     all_gray_cands = cands
                 if len(cands) == len(gl_values):
                     gl_candidates = cands
-                    gl_px   = np.array([row * SCALE for row in gl_candidates], dtype=float)
+                    gl_px   = np.array([(row + top) * SCALE for row in gl_candidates], dtype=float)
                     gl_vals = np.array(gl_values, dtype=float)
                     coeffs  = np.polyfit(gl_px, gl_vals, 1)
-                    row_to_kwh = lambda row, c=coeffs: float(np.polyval(c, row))
+                    row_to_kwh = lambda row, c=coeffs, off=abs_off: float(np.polyval(c, row + off))
                     print(f"[pixel] gridline calibration OK slope={coeffs[0]:.4f} intercept={coeffs[1]:.1f}")
                     break
+
+            # all_gray_cands is in CROP-relative coords; crop_to_slice = 0 here
+            # (keeping variable for gap-fill compat)
+            crop_to_slice = 0
 
             # --- INFER MISSING GRIDLINES IN LARGE GAPS ---
             # Tall bars can cover a gridline, making it invisible at normal thresholds.
@@ -324,10 +327,10 @@ def pixel_extract_bars(pil_image, meta):
                     )
                     if len(new_cands) == len(gl_values):
                         gl_candidates = new_cands
-                        gl_px   = np.array([row * SCALE for row in gl_candidates], dtype=float)
+                        gl_px   = np.array([(row + top) * SCALE for row in gl_candidates], dtype=float)
                         gl_vals = np.array(gl_values, dtype=float)
                         coeffs  = np.polyfit(gl_px, gl_vals, 1)
-                        row_to_kwh = lambda row, c=coeffs: float(np.polyval(c, row))
+                        row_to_kwh = lambda row, c=coeffs, off=abs_off: float(np.polyval(c, row + off))
                         print(f"[pixel] gridline calibration OK after gap-fill: "
                               f"slope={coeffs[0]:.4f} intercept={coeffs[1]:.1f}")
 
@@ -340,13 +343,13 @@ def pixel_extract_bars(pil_image, meta):
                             (gl_values[1:],  'top'),
                             (gl_values[:-1], 'bottom'),
                         ]:
-                            gl_px  = np.array([r * SCALE for r in new_cands], dtype=float)
+                            gl_px  = np.array([(r + top) * SCALE for r in new_cands], dtype=float)
                             gl_v   = np.array(trimmed, dtype=float)
                             c      = np.polyfit(gl_px, gl_v, 1)
                             res    = np.abs(np.polyval(c, gl_px) - gl_v).max()
                             if res < 15:
                                 gl_candidates = list(new_cands)
-                                row_to_kwh = lambda row, cf=c: float(np.polyval(cf, row))
+                                row_to_kwh = lambda row, cf=c, off=abs_off: float(np.polyval(cf, row + off))
                                 print(f"[pixel] calibration OK (trimmed {trim_label} value): "
                                       f"slope={c[0]:.4f} intercept={c[1]:.1f}")
                                 break
@@ -374,7 +377,8 @@ def pixel_extract_bars(pil_image, meta):
                 max_sz = min(len(sorted_cands), len(gl_values))
                 for sz in range(max_sz, 2, -1):
                     for cand_sub in combinations(sorted_cands, sz):
-                        px_sub = np.array([row * SCALE for row in cand_sub], dtype=float)
+                        # Use absolute zoomed rows for calibration (crop-relative + top)
+                        px_sub = np.array([(row + top) * SCALE for row in cand_sub], dtype=float)
                         for val_sub in combinations(gl_values, sz):
                             v = np.array(val_sub, dtype=float)
                             if v.max() == v.min():
@@ -397,7 +401,7 @@ def pixel_extract_bars(pil_image, meta):
 
                 if best_res < residual_thresh and best_coeffs is not None:
                     gl_candidates = list(best_cands)
-                    row_to_kwh = lambda row, c=best_coeffs: float(np.polyval(c, row))
+                    row_to_kwh = lambda row, c=best_coeffs, off=abs_off: float(np.polyval(c, row + off))
                     print(f"[pixel] partial gridline fit: {len(best_cands)} rows, "
                           f"slope={best_coeffs[0]:.4f}, max_residual={best_res:.1f}")
                 else:
@@ -777,7 +781,6 @@ def extract_with_claude(images_b64, pil_images=None):
             meta_response = client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=600,
-                temperature=0,
                 messages=[{
                     "role": "user",
                     "content": image_content + [{"type": "text", "text": CHART_META_PROMPT}]
