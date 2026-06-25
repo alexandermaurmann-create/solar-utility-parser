@@ -878,8 +878,18 @@ def build_monthly_history(raw_history, billing_period_end=None):
             pass
 
     if anchor_y is not None:
-        end_y, end_m = anchor_y, anchor_m
-        # Keep only entries within the 12-month window ending at billing period end.
+        latest_y = parsed[-1]["year"]
+        latest_m = parsed[-1]["month_index"]
+        # If the chart's newest bar extends BEYOND the billing period (e.g. Burlington
+        # shows a Jul 25 bar on a bill ending Jun 25), use the chart's newest bar as
+        # the window end so we don't drop it.  Only anchor to billing_period_end when
+        # the chart's data ends at or before the billing period (e.g. Elexicon 13-bar
+        # chart where the newest bar may be missing from pixel extraction).
+        if (latest_y, latest_m) > (anchor_y, anchor_m):
+            end_y, end_m = latest_y, latest_m
+        else:
+            end_y, end_m = anchor_y, anchor_m
+        # Keep only entries within the 12-month window ending at end_y/end_m.
         start_m, start_y = end_m, end_y
         for _ in range(11):
             start_m -= 1
