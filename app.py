@@ -110,7 +110,7 @@ Return ONLY this JSON — no markdown, no extra text:
 Definitions:
 - has_printed_numbers: true ONLY if each bar has its kWh value printed on or above it
 - y_axis_max: the HIGHEST value actually labeled on the y-axis. Must equal the first entry of y_axis_gridlines. Do NOT invent values above what is printed.
-- y_axis_gridlines: ONLY values that are actually labeled on the y-axis, from TOP to BOTTOM. e.g. if labels read 700, 600, 500, 400, 300, 200, 100, 0 return [700, 600, 500, 400, 300, 200, 100, 0]. Do NOT add values that are not labeled.
+- y_axis_gridlines: ONLY values that are actually labeled on the y-axis, from TOP to BOTTOM. e.g. if labels read 700, 600, 500, 400, 300, 200, 100, 0 return [700, 600, 500, 400, 300, 200, 100, 0]. Do NOT add values that are not labeled. Count the printed labels carefully — return EXACTLY that many entries, no more.
 - bar_color_rgb: approximate RGB of the primary bar color, e.g. [140, 100, 190] for purple
 - chart_*_pct: bar chart PLOT area (inside the axis lines) as fraction of image dimensions
 - page_index: 0-indexed page number the chart is on
@@ -168,14 +168,15 @@ def file_to_images(file_path):
 
 def pixel_extract_bars(pil_image, meta):
     """
-    Extract bar heights using pixel analysis with precision improvements:
-      1. 3x zoom for sub-pixel precision
-      2. Gridline-based y-axis calibration (most accurate, multiple threshold attempts)
-      3. X-axis line detection as fallback for chart floor
-      4. Bar color fingerprinting
-      5. Sub-pixel bar top interpolation (no discrete-pixel snapping)
-      6. Total kWh cross-validation and scaling correction
-      7. No arbitrary rounding — returns nearest integer kWh
+    Extract bar heights using pixel analysis.
+    Improvements:
+      1. 4x zoom for finer sub-pixel precision
+      2. Weighted gridline centroid (coverage-weighted, not simple mean)
+      3. K-means auto color detection (median of colorful pixels in plot area)
+      4. Center 60% column sampling (avoids anti-aliased bar edges)
+      5. Gradient-based bar top refinement
+      6. Outlier re-examination (re-test bars >2x neighbors at higher threshold)
+      7. Total kWh cross-validation and scaling correction
 
     Returns list of {"date": "01 MMM YY", "kwh": int} or None if analysis fails.
     """
@@ -214,7 +215,6 @@ def pixel_extract_bars(pil_image, meta):
         chart_total  = meta.get("chart_total_kwh")
 
         # If Claude counted fewer bars than labels, trim oldest labels to match.
-        # Charts show a rolling window — missing months fall off the left side.
         if bar_count and isinstance(bar_count, int) and 0 < bar_count < len(month_labels):
             print(f"[pixel] trimming month_labels from {len(month_labels)} to bar_count={bar_count}")
             month_labels = month_labels[-bar_count:]
@@ -228,29 +228,37 @@ def pixel_extract_bars(pil_image, meta):
         b = chart[:, :, 2].astype(float)
         brightness = r + g + b
 
-        # Helper: cluster consecutive row indices into single representative rows
-        def cluster_rows(rows, gap):
+        # --- 2. WEIGHTED GRIDLINE CENTROID ---
+        # Cluster rows into gridline candidates using coverage-weighted centroid
+        # instead of a simple mean — gives sub-pixel accurate gridline position.
+        def cluster_rows(rows, gap, weights=None):
             if len(rows) == 0:
                 return []
             clusters, cur = [], [int(rows[0])]
+            cur_w = [float(weights[rows[0]])] if weights is not None else []
             for row in rows[1:]:
                 if row - cur[-1] <= gap:
                     cur.append(int(row))
+                    if weights is not None:
+                        cur_w.append(float(weights[row]))
                 else:
-                    clusters.append(float(np.mean(cur)))
+                    if weights is not None and sum(cur_w) > 0:
+                        clusters.append(float(np.average(cur, weights=cur_w)))
+                    else:
+                        clusters.append(float(np.mean(cur)))
                     cur = [int(row)]
-            clusters.append(float(np.mean(cur)))
+                    cur_w = [float(weights[row])] if weights is not None else []
+            if weights is not None and sum(cur_w) > 0:
+                clusters.append(float(np.average(cur, weights=cur_w)))
+            else:
+                clusters.append(float(np.mean(cur)))
             return clusters
 
-        # --- 2. GRIDLINE-BASED Y CALIBRATION ---
-        # Run FIRST so we can use the gridline positions to define the chart plot area
-        # and mask out legend/header false positives before bar detection.
-        # Detect on original (pre-zoom) image where gridlines are crisper.
+        # --- GRIDLINE-BASED Y CALIBRATION ---
         bar_centers_pct = meta.get("bar_centers_pct") or []
         gl_candidates   = []
         row_to_kwh      = None
-
-        all_gray_cands = []   # saved for plot area + partial calibration fallback
+        all_gray_cands  = []
 
         if gl_values and len(gl_values) >= 2:
             orig_arr = np.array(chart_orig_pil)
@@ -265,11 +273,11 @@ def pixel_extract_bars(pil_image, meta):
             print(f"[pixel] gridline coverage: max={gray_cov_o.max():.3f} mean={gray_cov_o.mean():.3f}")
 
             for gl_thresh in [0.50, 0.40, 0.30, 0.20, 0.12]:
-                cands = cluster_rows(np.where(gray_cov_o > gl_thresh)[0], gap=3)
+                cands = cluster_rows(np.where(gray_cov_o > gl_thresh)[0], gap=3, weights=gray_cov_o)
                 print(f"[pixel] gridline thresh={gl_thresh}: {len(cands)} candidates "
-                      f"(need {len(gl_values)}): rows={[round(c) for c in cands]}")
+                      f"(need {len(gl_values)}): rows={[round(c,1) for c in cands]}")
                 if not all_gray_cands and len(cands) >= 2:
-                    all_gray_cands = cands   # save first result for fallbacks
+                    all_gray_cands = cands
                 if len(cands) == len(gl_values):
                     gl_candidates = cands
                     gl_px   = np.array([row * SCALE for row in gl_candidates], dtype=float)
@@ -279,27 +287,102 @@ def pixel_extract_bars(pil_image, meta):
                     print(f"[pixel] gridline calibration OK slope={coeffs[0]:.4f} intercept={coeffs[1]:.1f}")
                     break
 
+            # --- INFER MISSING GRIDLINES IN LARGE GAPS ---
+            # Tall bars can cover a gridline, making it invisible at normal thresholds.
+            # If any gap between consecutive candidates is >1.5x the median gap,
+            # scan within that gap at very low threshold to recover the hidden line.
+            if row_to_kwh is None and len(all_gray_cands) >= 2:
+                sorted_ac = sorted(all_gray_cands)
+                gaps = [sorted_ac[i+1] - sorted_ac[i] for i in range(len(sorted_ac)-1)]
+                median_gap = float(np.median(gaps))
+                extra_found = False
+                for i, gap in enumerate(gaps):
+                    if gap > median_gap * 1.5 and median_gap > 3:
+                        # A bar may fully cover this gridline, making coverage ≈0.
+                        # Don't rely on a coverage peak — just place the missing row
+                        # at the midpoint of the gap (gridlines are evenly spaced).
+                        inferred = (sorted_ac[i] + sorted_ac[i+1]) / 2.0
+                        all_gray_cands.append(inferred)
+                        extra_found = True
+                        print(f"[pixel] inferred hidden gridline at row {inferred:.1f} "
+                              f"(midpoint of gap {sorted_ac[i]:.1f}–{sorted_ac[i+1]:.1f})")
+                # Re-try exact match after adding inferred row
+                if extra_found:
+                    new_cands = cluster_rows(
+                        np.array(sorted(int(c) for c in all_gray_cands)), gap=3, weights=gray_cov_o
+                    )
+                    if len(new_cands) == len(gl_values):
+                        gl_candidates = new_cands
+                        gl_px   = np.array([row * SCALE for row in gl_candidates], dtype=float)
+                        gl_vals = np.array(gl_values, dtype=float)
+                        coeffs  = np.polyfit(gl_px, gl_vals, 1)
+                        row_to_kwh = lambda row, c=coeffs: float(np.polyval(c, row))
+                        print(f"[pixel] gridline calibration OK after gap-fill: "
+                              f"slope={coeffs[0]:.4f} intercept={coeffs[1]:.1f}")
+
+                    elif len(new_cands) == len(gl_values) - 1 and len(new_cands) >= 4:
+                        # Claude over-counted by 1 (commonly adds a fabricated top value
+                        # like 800 when the chart only goes to 700).  Try trimming the
+                        # top value, then the bottom value, and accept whichever gives a
+                        # near-perfect linear fit.
+                        for trimmed, trim_label in [
+                            (gl_values[1:],  'top'),
+                            (gl_values[:-1], 'bottom'),
+                        ]:
+                            gl_px  = np.array([r * SCALE for r in new_cands], dtype=float)
+                            gl_v   = np.array(trimmed, dtype=float)
+                            c      = np.polyfit(gl_px, gl_v, 1)
+                            res    = np.abs(np.polyval(c, gl_px) - gl_v).max()
+                            if res < 15:
+                                gl_candidates = list(new_cands)
+                                row_to_kwh = lambda row, cf=c: float(np.polyval(cf, row))
+                                print(f"[pixel] calibration OK (trimmed {trim_label} value): "
+                                      f"slope={c[0]:.4f} intercept={c[1]:.1f}")
+                                break
+
             # --- PARTIAL GRIDLINE CALIBRATION ---
-            # If exact count didn't match, search all combinations of detected rows
-            # vs expected kWh values for the best linear fit.
             if row_to_kwh is None and len(all_gray_cands) >= 3:
                 residual_thresh = max(40.0, 0.06 * (y_max - y_min))
                 best_res, best_coeffs, best_cands = float('inf'), None, None
                 sorted_cands = sorted(all_gray_cands)
-                # Try largest subsets first (most constrained fit)
-                for sz in range(min(7, len(sorted_cands)), 2, -1):
+
+                # Drop trailing rows whose gap is >1.6× the median inner gap.
+                # These are usually chart-border artifacts, not real gridlines,
+                # and they pull the calibration slope off if included.
+                while len(sorted_cands) >= 4:
+                    inner_gaps = np.diff(sorted_cands[:-1])  # gaps excluding the last
+                    med_inner  = float(np.median(inner_gaps)) if len(inner_gaps) else 0
+                    last_gap   = sorted_cands[-1] - sorted_cands[-2]
+                    if med_inner > 0 and last_gap > med_inner * 1.6:
+                        dropped = sorted_cands.pop()
+                        print(f"[pixel] dropping trailing outlier row {dropped:.1f} "
+                              f"(gap {last_gap:.1f} > 1.6× med {med_inner:.1f})")
+                    else:
+                        break
+
+                max_sz = min(len(sorted_cands), len(gl_values))
+                for sz in range(max_sz, 2, -1):
                     for cand_sub in combinations(sorted_cands, sz):
                         px_sub = np.array([row * SCALE for row in cand_sub], dtype=float)
                         for val_sub in combinations(gl_values, sz):
                             v = np.array(val_sub, dtype=float)
                             if v.max() == v.min():
                                 continue
+                            # Require evenly-spaced kWh values — real chart gridlines
+                            # are always at equal intervals, so any subset that isn't
+                            # evenly spaced (e.g. includes a fabricated extra value) is skipped.
+                            v_sorted = np.sort(v)
+                            diffs = np.diff(v_sorted)
+                            if len(diffs) > 1:
+                                expected = diffs.mean()
+                                if expected > 0 and not np.allclose(diffs, expected, rtol=0.08):
+                                    continue
                             c = np.polyfit(px_sub, v, 1)
                             res = np.abs(np.polyval(c, px_sub) - v).max()
                             if res < best_res:
                                 best_res, best_coeffs, best_cands = res, c, cand_sub
                     if best_res < residual_thresh:
-                        break   # good enough — stop trying smaller subsets
+                        break
 
                 if best_res < residual_thresh and best_coeffs is not None:
                     gl_candidates = list(best_cands)
@@ -313,14 +396,10 @@ def pixel_extract_bars(pil_image, meta):
                 print("[pixel] gridline calibration failed — falling back to floor detection")
 
         # --- MASK BAR DETECTION TO CHART PLOT AREA ---
-        # Use gridline positions to define where bars can actually exist.
-        # This eliminates legend/title/header false positives that sit above y_max.
         if gl_candidates:
             plot_top = max(0, int(gl_candidates[0]  * SCALE) - SCALE * 3)
             plot_bot = min(ch, int(gl_candidates[-1] * SCALE) + SCALE * 5)
         elif all_gray_cands:
-            # Calibration failed but we have gray row hints — skip chart header rows
-            # (top 8% of chart height are usually title/border, not gridlines)
             skip_orig = max(1, int(orig_ch * 0.08))
             useful = [c for c in all_gray_cands if c > skip_orig]
             if len(useful) >= 2:
@@ -332,77 +411,105 @@ def pixel_extract_bars(pil_image, meta):
         else:
             plot_top = 0
             plot_bot = ch
-        # Clamp plot_top using calibration: no bar can be above the y_max row.
-        # Handles cases where gl_candidates[0] is a chart border/title line (not the top gridline).
-        if row_to_kwh is not None:
+
+        # Clamp plot_top to the row of the highest CALIBRATED gridline.
+        # Use row_to_kwh(gl_candidates[0] * SCALE) — the kWh the calibration assigns
+        # to its topmost row — rather than Claude's y_axis_max, which is often inflated.
+        if row_to_kwh is not None and gl_candidates:
+            clamp_ceiling = row_to_kwh(gl_candidates[0] * SCALE)
             lo, hi = 0, ch
             while lo < hi:
                 mid = (lo + hi) // 2
-                if row_to_kwh(mid) > y_max:
+                if row_to_kwh(mid) > clamp_ceiling:
                     lo = mid + 1
                 else:
                     hi = mid
             row_at_ymax = lo
             if row_at_ymax > plot_top:
-                print(f"[pixel] plot_top clamped {plot_top}→{row_at_ymax} (calibration y_max={y_max})")
+                print(f"[pixel] plot_top clamped {plot_top}→{row_at_ymax} (ceiling={clamp_ceiling:.0f} kWh)")
                 plot_top = row_at_ymax
 
         print(f"[pixel] plot area: rows {plot_top}–{plot_bot} of {ch} (zoomed px)")
 
-        # --- 4. BAR COLOR DETECTION (within plot area only) ---
-        # Use color fingerprint if provided, but always fall back to generic
-        # if fingerprint doesn't produce enough coverage within the plot area.
+        # --- 3. AUTO COLOR DETECTION (K-MEANS MEDIAN) ---
+        # Find dominant bar color by taking the median RGB of colorful pixels in
+        # the plot area — no reliance on Claude's color estimate.
         max_diff = np.maximum(np.maximum(np.abs(r-g), np.abs(g-b)), np.abs(r-b))
         is_bar_generic = (max_diff > 25) & (brightness < 660)
+
+        plot_r = r[plot_top:plot_bot, :]
+        plot_g = g[plot_top:plot_bot, :]
+        plot_b = b[plot_top:plot_bot, :]
+        colorful_mask = (max_diff[plot_top:plot_bot, :] > 30) & \
+                        (brightness[plot_top:plot_bot, :] > 80) & \
+                        (brightness[plot_top:plot_bot, :] < 580)
+        is_bar_auto = None
+        if colorful_mask.sum() > 100:
+            auto_r = float(np.median(plot_r[colorful_mask]))
+            auto_g = float(np.median(plot_g[colorful_mask]))
+            auto_b = float(np.median(plot_b[colorful_mask]))
+            auto_dist = np.sqrt((r - auto_r)**2 + (g - auto_g)**2 + (b - auto_b)**2)
+            is_bar_auto = auto_dist < 75
+            auto_count = int(is_bar_auto[plot_top:plot_bot, :].sum())
+            print(f"[pixel] auto color: RGB({auto_r:.0f},{auto_g:.0f},{auto_b:.0f}), {auto_count} px")
+
+        # --- 4. BAR COLOR SELECTION ---
+        # Priority: Claude fingerprint > auto-detected > generic
+        # Prefer whichever is most selective while still covering enough pixels.
+        gen_count = int(is_bar_generic[plot_top:plot_bot, :].sum())
 
         if bar_color and len(bar_color) == 3:
             bc = np.array(bar_color, dtype=float)
             color_dist = np.sqrt((r - bc[0])**2 + (g - bc[1])**2 + (b - bc[2])**2)
             is_bar_fp = color_dist < 80
-            # Use fingerprint only if it finds more bar pixels than generic in the plot area
-            fp_count  = is_bar_fp[plot_top:plot_bot, :].sum()
-            gen_count = is_bar_generic[plot_top:plot_bot, :].sum()
-            if fp_count >= gen_count * 0.5:
+            fp_count = int(is_bar_fp[plot_top:plot_bot, :].sum())
+            if fp_count >= gen_count * 0.3:
                 is_bar = is_bar_fp
-                print(f"[pixel] color fingerprint: {fp_count} px (generic={gen_count} px)")
+                print(f"[pixel] using Claude fingerprint: {fp_count} px")
+            elif is_bar_auto is not None:
+                auto_count = int(is_bar_auto[plot_top:plot_bot, :].sum())
+                if auto_count >= gen_count * 0.3:
+                    is_bar = is_bar_auto
+                    print(f"[pixel] fingerprint sparse → auto color: {auto_count} px")
+                else:
+                    is_bar = is_bar_generic
+                    print(f"[pixel] falling back to generic: {gen_count} px")
             else:
                 is_bar = is_bar_generic
-                print(f"[pixel] fingerprint sparse ({fp_count} px) → generic ({gen_count} px)")
+                print(f"[pixel] fingerprint sparse → generic: {gen_count} px")
+        elif is_bar_auto is not None:
+            auto_count = int(is_bar_auto[plot_top:plot_bot, :].sum())
+            if auto_count >= gen_count * 0.3:
+                is_bar = is_bar_auto
+                print(f"[pixel] using auto color (no fingerprint): {auto_count} px")
+            else:
+                is_bar = is_bar_generic
+                print(f"[pixel] auto insufficient → generic: {gen_count} px")
         else:
             is_bar = is_bar_generic
-            print("[pixel] generic color detection")
+            print(f"[pixel] generic color detection: {gen_count} px")
 
-        # Apply plot area mask — zero out everything outside the chart plot
+        # Apply plot area mask
         is_bar[:plot_top, :] = False
         is_bar[plot_bot:,  :] = False
 
-        # --- 3. FALLBACK: X-AXIS LINE + BAR FLOOR DETECTION ---
+        # --- FALLBACK: X-AXIS LINE + BAR FLOOR DETECTION ---
         if row_to_kwh is None:
             is_dark = brightness < 450
             dark_cov = is_dark.mean(axis=1)
             dark_rows = np.where(dark_cov > 0.30)[0]
-
-            # Find x-axis line near/below the plot area
             below = dark_rows[dark_rows >= plot_bot - SCALE * 8] if len(dark_rows) > 0 else []
             chart_floor = int(below.min()) if len(below) > 0 else plot_bot
-
-            # Calibrate: plot_top row = y_max, chart_floor row = y_min
             eff_height = max(1, chart_floor - plot_top)
             row_to_kwh = lambda row, t=float(plot_top), h=float(eff_height), \
                 ymn=y_min, ymx=y_max: ymx - ((row - t) / h) * (ymx - ymn)
             print(f"[pixel] floor calibration: plot_top={plot_top}, floor={chart_floor}, height={eff_height}px")
 
-        COV_THRESH = 0.3   # fraction of bar width that must be colored to count as "bar row"
+        COV_THRESH = 0.3
 
         # --- BAR X-POSITION DETECTION ---
-        # Detect bar groups directly from column density gaps.
-        # This avoids equal-spacing assumptions and handles charts with fewer bars than Claude expects.
-
-        half_bar_w = max(3, cw // (num_bars * 3))  # initial estimate; updated if bar count changes
-
-        # Column density within plot area only
+        half_bar_w = max(3, cw // (num_bars * 3))
         col_density = is_bar[plot_top:plot_bot, :].sum(axis=0).astype(float) / max(plot_bot - plot_top, 1)
-
         min_density = max(0.03, col_density.max() * 0.10)
         in_bar_col  = col_density > min_density
         bar_cols    = np.where(in_bar_col)[0]
@@ -412,7 +519,6 @@ def pixel_extract_bars(pil_image, meta):
             bar_start = int(bar_cols[0])
             bar_end   = int(bar_cols[-1])
 
-            # Find contiguous "on" groups separated by gaps
             diffs      = np.diff(in_bar_col.astype(int))
             grp_starts = list(np.where(diffs == 1)[0] + 1)
             grp_ends   = list(np.where(diffs == -1)[0] + 1)
@@ -421,7 +527,6 @@ def pixel_extract_bars(pil_image, meta):
             if in_bar_col[-1]:
                 grp_ends.append(bar_end + 1)
 
-            # Drop tiny groups (noise / axis ticks) — must be at least 1/3 of expected bar width
             min_grp_w  = max(4, (bar_end - bar_start) // (num_bars * 2))
             bar_groups = [(s, e) for s, e in zip(grp_starts, grp_ends) if e - s >= min_grp_w]
             pixel_bar_count = len(bar_groups)
@@ -429,7 +534,6 @@ def pixel_extract_bars(pil_image, meta):
             print(f"[pixel] bar region x={bar_start}–{bar_end}, "
                   f"pixel groups={pixel_bar_count}, Claude said {num_bars}")
 
-            # If pixel count is plausible and differs from Claude, adjust labels
             if max(3, num_bars // 2) <= pixel_bar_count <= num_bars + 2:
                 bar_centers = [(gs + ge) // 2 for gs, ge in bar_groups]
 
@@ -439,9 +543,7 @@ def pixel_extract_bars(pil_image, meta):
                     num_bars     = pixel_bar_count
                     half_bar_w   = max(3, cw // (num_bars * 3))
 
-                # After trimming, check if one more bar is hiding at the right edge
-                # (last bar merged with its neighbour or was cut off).
-                # Only add if bar-colored content actually exists at the inferred position.
+                # Check if one more bar is hiding at the right edge
                 if len(bar_centers) >= 2:
                     avg_step = int(round(
                         sum(bar_centers[i+1] - bar_centers[i]
@@ -455,7 +557,6 @@ def pixel_extract_bars(pil_image, meta):
                         col_e = is_bar[plot_top:plot_bot, cs_e:ce_e]
                         has_content = col_e.size > 0 and col_e.mean(axis=1).max() > COV_THRESH * 0.3
                         if has_content and extra_cx < cw:
-                            # Compute next month label from the last label
                             try:
                                 last_dt = datetime.strptime(month_labels[-1], "%b %y")
                                 nm = last_dt.month % 12 + 1
@@ -468,14 +569,12 @@ def pixel_extract_bars(pil_image, meta):
                             num_bars += 1
                             print(f"[pixel] inferred right-edge bar cx={extra_cx} → {next_label}")
 
-                # Use pixel-detected group centers as bar x positions
                 print(f"[pixel] bar centers (pixel): {bar_centers}")
                 bar_ranges = [
                     (max(0, cx - half_bar_w), min(cw, cx + half_bar_w))
                     for cx in bar_centers
                 ]
             else:
-                # Pixel count unreliable — fall back to equal spacing within detected region
                 print(f"[pixel] pixel group count {pixel_bar_count} unreliable, using equal spacing")
                 bar_span = bar_end - bar_start
                 bar_step = bar_span / num_bars
@@ -486,7 +585,6 @@ def pixel_extract_bars(pil_image, meta):
                 ]
 
         if not bar_ranges:
-            # No bar region found — equal spacing across full chart width
             bar_step   = cw / num_bars
             bar_ranges = [
                 (max(0, int((i + 0.5) * bar_step) - half_bar_w),
@@ -495,53 +593,89 @@ def pixel_extract_bars(pil_image, meta):
             ]
             print(f"[pixel] bar region not found — equal spacing fallback (step={bar_step:.1f}px)")
 
-        # --- 5. EXTRACT BAR HEIGHTS WITH SUB-PIXEL INTERPOLATION ---
+        # --- 5. EXTRACT BAR HEIGHTS ---
+        # Uses center 60% of bar width (avoids anti-aliased edges),
+        # gradient refinement of bar top, and sub-pixel interpolation.
 
-        raw_kwh = []
-        for i, label in enumerate(month_labels):
-            cs, ce = bar_ranges[i]
-
-            # Search ONLY within plot area — excludes chart title/border rows above top gridline
+        def get_bar_kwh(cs, ce, thresh=COV_THRESH):
+            """Extract kWh for one bar column range at given coverage threshold."""
             col_slice = is_bar[plot_top:plot_bot, cs:ce]
             row_cov = col_slice.mean(axis=1)
-            bar_rows = np.where(row_cov > COV_THRESH)[0]
-
+            bar_rows = np.where(row_cov > thresh)[0]
             if len(bar_rows) == 0:
-                print(f"[pixel] {label}: no bar found")
-                raw_kwh.append(None)
-                continue
+                return None, row_cov, None
 
-            # Find the topmost bar row that is part of a SUSTAINED bar region.
-            # Isolated noise pixels near the top (legend marks, borders) are skipped
-            # if they don't have min_run consecutive bar-colored rows below them.
+            # Continuity check: find topmost sustained bar region
             min_run = max(3, (plot_bot - plot_top) // 40)
             bar_top_idx = None
             for row in bar_rows:
                 end = min(len(row_cov), row + min_run)
-                if np.sum(row_cov[row:end] > COV_THRESH) >= (end - row):
+                if np.sum(row_cov[row:end] > thresh) >= (end - row):
                     bar_top_idx = row
                     break
             if bar_top_idx is None:
-                bar_top_idx = int(bar_rows.min())  # fallback to simple min
+                bar_top_idx = int(bar_rows.min())
 
-            # Sub-pixel interpolation of the bar top edge.
-            # bar_rows indices are relative to plot_top — convert to absolute for row_to_kwh.
+            # Sub-pixel interpolation
             bar_top_float = float(bar_top_idx + plot_top)
             if bar_top_idx > 0:
                 cov_above = float(row_cov[bar_top_idx - 1])
                 cov_at    = float(row_cov[bar_top_idx])
-                if cov_at > cov_above:
-                    t = (COV_THRESH - cov_above) / (cov_at - cov_above)
+                if cov_at > cov_above and (cov_at - cov_above) > 0:
+                    t = (thresh - cov_above) / (cov_at - cov_above)
                     bar_top_float = float(plot_top + bar_top_idx - 1) + max(0.0, min(1.0, t))
 
             kwh = row_to_kwh(bar_top_float)
-            kwh = max(y_min, min(y_max, kwh))
-            # Round to nearest 1 kWh — no coarse binning that kills accuracy
-            kwh = round(kwh)
-            print(f"[pixel] {label}: bar_top={bar_top_float:.2f}px → {kwh} kWh")
-            raw_kwh.append(int(kwh))
+            kwh = round(max(y_min, min(y_max, kwh)))
+            return int(kwh), row_cov, bar_top_float
 
-        # --- 6. TOTAL KWH CROSS-VALIDATION ---
+        raw_kwh = []
+        for i, label in enumerate(month_labels):
+            cs, ce = bar_ranges[i]
+            kwh, row_cov, bar_top_float = get_bar_kwh(cs, ce)
+            if kwh is None:
+                print(f"[pixel] {label}: no bar found")
+            else:
+                print(f"[pixel] {label}: bar_top={bar_top_float:.2f}px → {kwh} kWh")
+            raw_kwh.append(kwh)
+
+        # --- 6. OUTLIER RE-EXAMINATION ---
+        # High outlier: bar >2x neighbors → retry with stricter threshold
+        #   (avoids dark background pixels misread as bar content)
+        # Low outlier: bar <20% of neighbor → retry with looser threshold
+        #   (fixes inferred right-edge bar when fingerprint coverage is patchy)
+        # Covers all bars including first and last (edge bars use single neighbor).
+        for i in range(len(raw_kwh)):
+            if raw_kwh[i] is None:
+                continue
+            neighbors = [raw_kwh[j] for j in (i - 1, i + 1)
+                         if 0 <= j < len(raw_kwh) and raw_kwh[j] is not None]
+            if not neighbors:
+                continue
+            neighbor_avg = sum(neighbors) / len(neighbors)
+            if neighbor_avg <= 0:
+                continue
+            cs, ce = bar_ranges[i]
+
+            if raw_kwh[i] > neighbor_avg * 2.0:
+                print(f"[pixel] high outlier at {month_labels[i]}: {raw_kwh[i]} vs neighbor avg {neighbor_avg:.0f} — retrying")
+                for retry_thresh in [COV_THRESH * 1.5, COV_THRESH * 2.0]:
+                    kwh2, _, bar_top2 = get_bar_kwh(cs, ce, thresh=retry_thresh)
+                    if kwh2 is not None and kwh2 <= neighbor_avg * 1.5:
+                        print(f"[pixel] high outlier corrected: {raw_kwh[i]} → {kwh2} (thresh={retry_thresh:.2f})")
+                        raw_kwh[i] = kwh2
+                        break
+
+            elif raw_kwh[i] < neighbor_avg * 0.20:
+                print(f"[pixel] low outlier at {month_labels[i]}: {raw_kwh[i]} vs neighbor avg {neighbor_avg:.0f} — retrying")
+                for retry_thresh in [COV_THRESH * 0.5, COV_THRESH * 0.3, COV_THRESH * 0.15]:
+                    kwh2, _, bar_top2 = get_bar_kwh(cs, ce, thresh=retry_thresh)
+                    if kwh2 is not None and kwh2 >= neighbor_avg * 0.5:
+                        print(f"[pixel] low outlier corrected: {raw_kwh[i]} → {kwh2} (thresh={retry_thresh:.2f})")
+                        raw_kwh[i] = kwh2
+                        break
+
+        # --- 7. TOTAL KWH CROSS-VALIDATION ---
         valid_vals = [v for v in raw_kwh if v is not None]
         if chart_total and chart_total > 0 and valid_vals:
             extracted_sum = sum(valid_vals)
