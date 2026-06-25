@@ -62,7 +62,11 @@ Rules:
 - delivery_charge = Delivery charge in dollars (number only, no $ sign)
 - regulatory_charge = Regulatory charge in dollars (number only, no $ sign)
 - billing_period_start/end = meter reading period start and end dates
-- monthly_usage_history = ALL rows from the "Compare Your Daily Usage" bar chart/table (typically 13-15 months). Format dates as "DD MMM YY" (e.g. "20 MAR 26"). kWh values as plain integers.
+- monthly_usage_history = ALL bars from the usage history chart (typically 13-15 entries).
+  * Format every date as "DD MMM YY" (e.g. "26 FEB 26"). If dates are shown as "26-Feb-26", convert to "26 Feb 26".
+  * Use the billing period END date (read date) as each entry's date.
+  * If the Y-axis label says "KWH per day" or "Daily Average": look for a "# of Days" row below the chart. For each bar, compute monthly_kwh = round(daily_avg × days). Return the computed total kWh — NOT the raw daily average.
+  * If the Y-axis shows monthly kWh totals: return the bar values directly.
 - For fields that don't apply to the detected bill type, use null.
 - ALL numeric values must be plain numbers — NO commas, NO dollar signs, NO units.
 - If a field is not found, use null. For monthly_usage_history use [] if not found.
@@ -661,8 +665,8 @@ def extract_with_claude(images_b64, pil_images=None):
 
 
 def parse_history_date(date_str):
-    """Parse '20 MAR 26' or '20 MAR 2026' → (year, month_index 0-11)."""
-    for fmt in ("%d %b %y", "%d %b %Y"):
+    """Parse '20 MAR 26', '20 MAR 2026', or '26-Feb-26' → (year, month_index 0-11)."""
+    for fmt in ("%d %b %y", "%d %b %Y", "%d-%b-%y", "%d-%b-%Y"):
         try:
             dt = datetime.strptime(date_str.strip(), fmt)
             return dt.year, dt.month - 1
