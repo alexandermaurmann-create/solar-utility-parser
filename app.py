@@ -211,6 +211,17 @@ def pixel_extract_bars(pil_image, meta):
         month_labels = meta.get("month_labels", [])
         bar_count    = meta.get("bar_count")
         gl_values    = meta.get("y_axis_gridlines") or []
+
+        # Strip fabricated top gridline: if gl_values[0] exceeds y_axis_max, drop it.
+        # Claude sometimes adds an extra value above the actual chart top (e.g. 800
+        # when Burlington's axis only goes to 700), causing need=N+1 and wrong calibration.
+        if gl_values and len(gl_values) >= 2:
+            step = abs(gl_values[0] - gl_values[1])
+            if step > 0 and gl_values[0] > y_max + step * 0.5:
+                print(f"[pixel] dropping fabricated top gridline {gl_values[0]} "
+                      f"(y_axis_max={y_max})")
+                gl_values = gl_values[1:]
+
         bar_color    = meta.get("bar_color_rgb")
         chart_total  = meta.get("chart_total_kwh")
 
@@ -766,6 +777,7 @@ def extract_with_claude(images_b64, pil_images=None):
             meta_response = client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=600,
+                temperature=0,
                 messages=[{
                     "role": "user",
                     "content": image_content + [{"type": "text", "text": CHART_META_PROMPT}]
