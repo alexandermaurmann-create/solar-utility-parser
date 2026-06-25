@@ -319,33 +319,60 @@
   async function submitFiles() {
     if (!selectedFiles.length) return;
 
-    showStatus('<span class="spinner"></span> Parsing ' + selectedFiles.length + ' bill(s)...');
     document.getElementById("parse-btn").disabled = true;
     document.getElementById("results-section").style.display = "none";
     document.getElementById("upload-error").innerHTML = "";
 
-    const fd = new FormData();
-    selectedFiles.forEach(f => fd.append("files", f));
+    // Build a fresh FormData per attempt (heavy bills can occasionally get a
+    // gateway hiccup / non-JSON response; we auto-retry once so a transient
+    // blip never reaches the user).
+    const buildForm = () => {
+      const fd = new FormData();
+      selectedFiles.forEach(f => fd.append("files", f));
+      return fd;
+    };
 
-    try {
-      const res = await fetch("/upload", { method: "POST", body: fd });
-      const data = await res.json();
-
-      if (!res.ok || data.error) {
-        showError(data.error || "Server error");
-        return;
-      }
-
-      renderTable(data.rows);
-      // Clear the queue so the next upload doesn't re-send already-parsed bills.
-      selectedFiles = [];
-      renderFileList();
-    } catch (e) {
-      showError("Could not connect to server: " + e.message);
-    } finally {
+    const finish = () => {
       hideStatus();
       document.getElementById("parse-btn").disabled = false;
+    };
+
+    const maxAttempts = 2;
+    let lastErr = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      showStatus('<span class="spinner"></span> Parsing ' + selectedFiles.length
+                 + ' bill(s)' + (attempt > 1 ? ' (retrying…)' : '…'));
+      try {
+        const res = await fetch("/upload", { method: "POST", body: buildForm() });
+        // Read as text first so a non-JSON error page doesn't throw an opaque error.
+        const raw = await res.text();
+        let data = null;
+        try { data = JSON.parse(raw); } catch (_) { data = null; }
+
+        if (data && Array.isArray(data.rows)) {
+          renderTable(data.rows);
+          selectedFiles = [];          // clear queue so the next upload is clean
+          renderFileList();
+          finish();
+          return;
+        }
+        if (data && data.error) {       // our server returned a real, explained error
+          finish();
+          showError(data.error);
+          return;
+        }
+        // Non-JSON / empty response = transient gateway or worker hiccup → retry.
+        lastErr = "The server was busy.";
+      } catch (e) {
+        lastErr = "Could not reach the server.";   // network drop → retry
+      }
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, 1200));  // brief pause before retrying
+      }
     }
+
+    finish();
+    showError((lastErr || "Something went wrong") + " Please try again in a moment.");
   }
 
   // --- Table ---
