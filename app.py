@@ -98,17 +98,20 @@ Return ONLY this JSON — no markdown, no extra text:
   "chart_right_pct": 0.0-1.0,
   "page_index": 0,
   "month_labels": ["Mar 25", "Apr 25", ...],
+  "bar_count": 12,
   "bar_centers_pct": [0.04, 0.11, 0.19, ...],
   "chart_total_kwh": number or null
 }
 
 Definitions:
 - has_printed_numbers: true ONLY if each bar has its kWh value printed on or above it
-- y_axis_gridlines: ALL y-axis label values from TOP (highest) to BOTTOM (lowest), e.g. [5000, 4000, 3000, 2000, 1000, 0]
+- y_axis_max: the HIGHEST value actually labeled on the y-axis. Must equal the first entry of y_axis_gridlines. Do NOT invent values above what is printed.
+- y_axis_gridlines: ONLY values that are actually labeled on the y-axis, from TOP to BOTTOM. e.g. if labels read 700, 600, 500, 400, 300, 200, 100, 0 return [700, 600, 500, 400, 300, 200, 100, 0]. Do NOT add values that are not labeled.
 - bar_color_rgb: approximate RGB of the primary bar color, e.g. [140, 100, 190] for purple
 - chart_*_pct: bar chart PLOT area (inside the axis lines) as fraction of image dimensions
 - page_index: 0-indexed page number the chart is on
-- month_labels: bar labels left to right, format "MMM YY"
+- month_labels: bar labels left to right, format "MMM YY". ONLY include months that have an actual visible bar — count the bars carefully
+- bar_count: exact number of bars visible in the chart (count them). Must equal len(month_labels).
 - bar_centers_pct: x-center of EACH bar as a fraction of the chart plot width (0.0=left edge, 1.0=right edge).
   Must have exactly the same number of entries as month_labels.
   Example for 4 bars evenly spaced with padding: [0.10, 0.35, 0.60, 0.85]
@@ -201,11 +204,18 @@ def pixel_extract_bars(pil_image, meta):
         y_min        = float(meta.get("y_axis_min", 0))
         y_max        = float(meta.get("y_axis_max", 5000))
         month_labels = meta.get("month_labels", [])
-        num_bars     = len(month_labels)
+        bar_count    = meta.get("bar_count")
         gl_values    = meta.get("y_axis_gridlines") or []
         bar_color    = meta.get("bar_color_rgb")
         chart_total  = meta.get("chart_total_kwh")
 
+        # If Claude counted fewer bars than labels, trim oldest labels to match.
+        # Charts show a rolling window — missing months fall off the left side.
+        if bar_count and isinstance(bar_count, int) and 0 < bar_count < len(month_labels):
+            print(f"[pixel] trimming month_labels from {len(month_labels)} to bar_count={bar_count}")
+            month_labels = month_labels[-bar_count:]
+
+        num_bars = len(month_labels)
         if num_bars == 0 or y_max <= y_min:
             return None
 
@@ -318,6 +328,21 @@ def pixel_extract_bars(pil_image, meta):
         else:
             plot_top = 0
             plot_bot = ch
+        # Clamp plot_top using calibration: no bar can be above the y_max row.
+        # Handles cases where gl_candidates[0] is a chart border/title line (not the top gridline).
+        if row_to_kwh is not None:
+            lo, hi = 0, ch
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if row_to_kwh(mid) > y_max:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            row_at_ymax = lo
+            if row_at_ymax > plot_top:
+                print(f"[pixel] plot_top clamped {plot_top}→{row_at_ymax} (calibration y_max={y_max})")
+                plot_top = row_at_ymax
+
         print(f"[pixel] plot area: rows {plot_top}–{plot_bot} of {ch} (zoomed px)")
 
         # --- 4. BAR COLOR DETECTION (within plot area only) ---
@@ -363,48 +388,117 @@ def pixel_extract_bars(pil_image, meta):
                 ymn=y_min, ymx=y_max: ymx - ((row - t) / h) * (ymx - ymn)
             print(f"[pixel] floor calibration: plot_top={plot_top}, floor={chart_floor}, height={eff_height}px")
 
-        # --- BAR X-POSITION DETECTION ---
-        # Detect actual bar pixel region, then equal-space within it.
-        # Claude's bar_centers_pct are unreliable (y-axis margin confuses the fractions).
-        print(f"[pixel] Claude bar_centers_pct (debug): {bar_centers_pct}")
+        COV_THRESH = 0.3   # fraction of bar width that must be colored to count as "bar row"
 
-        half_bar_w = max(3, cw // (num_bars * 3))  # half-width of column slice per bar
+        # --- BAR X-POSITION DETECTION ---
+        # Detect bar groups directly from column density gaps.
+        # This avoids equal-spacing assumptions and handles charts with fewer bars than Claude expects.
+
+        half_bar_w = max(3, cw // (num_bars * 3))  # initial estimate; updated if bar count changes
 
         # Column density within plot area only
         col_density = is_bar[plot_top:plot_bot, :].sum(axis=0).astype(float) / max(plot_bot - plot_top, 1)
 
-        # Find leftmost/rightmost columns that have bar-colored pixels
         min_density = max(0.03, col_density.max() * 0.10)
-        bar_cols = np.where(col_density > min_density)[0]
+        in_bar_col  = col_density > min_density
+        bar_cols    = np.where(in_bar_col)[0]
 
-        if len(bar_cols) >= num_bars:
+        bar_ranges = []
+        if len(bar_cols) >= 3:
             bar_start = int(bar_cols[0])
             bar_end   = int(bar_cols[-1])
-            bar_span  = bar_end - bar_start
-            bar_step  = bar_span / num_bars
-            bar_ranges = []
-            for i in range(num_bars):
-                cx = int(bar_start + (i + 0.5) * bar_step)
-                bar_ranges.append((max(0, cx - half_bar_w), min(cw, cx + half_bar_w)))
-            print(f"[pixel] bar region x={bar_start}–{bar_end} ({bar_span}px / "
-                  f"{num_bars} bars = {bar_step:.1f}px each)")
-        else:
-            # Fallback: equal spacing across full chart width
-            bar_step = cw / num_bars
-            bar_ranges = []
-            for i in range(num_bars):
-                cx = int((i + 0.5) * bar_step)
-                bar_ranges.append((max(0, cx - half_bar_w), min(cw, cx + half_bar_w)))
+
+            # Find contiguous "on" groups separated by gaps
+            diffs      = np.diff(in_bar_col.astype(int))
+            grp_starts = list(np.where(diffs == 1)[0] + 1)
+            grp_ends   = list(np.where(diffs == -1)[0] + 1)
+            if in_bar_col[0]:
+                grp_starts.insert(0, 0)
+            if in_bar_col[-1]:
+                grp_ends.append(bar_end + 1)
+
+            # Drop tiny groups (noise / axis ticks) — must be at least 1/3 of expected bar width
+            min_grp_w  = max(4, (bar_end - bar_start) // (num_bars * 2))
+            bar_groups = [(s, e) for s, e in zip(grp_starts, grp_ends) if e - s >= min_grp_w]
+            pixel_bar_count = len(bar_groups)
+
+            print(f"[pixel] bar region x={bar_start}–{bar_end}, "
+                  f"pixel groups={pixel_bar_count}, Claude said {num_bars}")
+
+            # If pixel count is plausible and differs from Claude, adjust labels
+            if max(3, num_bars // 2) <= pixel_bar_count <= num_bars + 2:
+                bar_centers = [(gs + ge) // 2 for gs, ge in bar_groups]
+
+                if pixel_bar_count != num_bars:
+                    print(f"[pixel] trimming month_labels from {num_bars} → {pixel_bar_count} (pixel count)")
+                    month_labels = month_labels[-pixel_bar_count:]
+                    num_bars     = pixel_bar_count
+                    half_bar_w   = max(3, cw // (num_bars * 3))
+
+                # After trimming, check if one more bar is hiding at the right edge
+                # (last bar merged with its neighbour or was cut off).
+                # Only add if bar-colored content actually exists at the inferred position.
+                if len(bar_centers) >= 2:
+                    avg_step = int(round(
+                        sum(bar_centers[i+1] - bar_centers[i]
+                            for i in range(len(bar_centers)-1))
+                        / (len(bar_centers) - 1)
+                    ))
+                    extra_cx = bar_centers[-1] + avg_step
+                    cs_e = max(0, extra_cx - half_bar_w)
+                    ce_e = min(cw, extra_cx + half_bar_w)
+                    if ce_e > cs_e:
+                        col_e = is_bar[plot_top:plot_bot, cs_e:ce_e]
+                        has_content = col_e.size > 0 and col_e.mean(axis=1).max() > COV_THRESH * 0.3
+                        if has_content and extra_cx < cw:
+                            # Compute next month label from the last label
+                            try:
+                                last_dt = datetime.strptime(month_labels[-1], "%b %y")
+                                nm = last_dt.month % 12 + 1
+                                ny = last_dt.year + (1 if last_dt.month == 12 else 0)
+                                next_label = datetime(ny, nm, 1).strftime("%b %y")
+                            except Exception:
+                                next_label = "Next"
+                            bar_centers.append(extra_cx)
+                            month_labels.append(next_label)
+                            num_bars += 1
+                            print(f"[pixel] inferred right-edge bar cx={extra_cx} → {next_label}")
+
+                # Use pixel-detected group centers as bar x positions
+                print(f"[pixel] bar centers (pixel): {bar_centers}")
+                bar_ranges = [
+                    (max(0, cx - half_bar_w), min(cw, cx + half_bar_w))
+                    for cx in bar_centers
+                ]
+            else:
+                # Pixel count unreliable — fall back to equal spacing within detected region
+                print(f"[pixel] pixel group count {pixel_bar_count} unreliable, using equal spacing")
+                bar_span = bar_end - bar_start
+                bar_step = bar_span / num_bars
+                bar_ranges = [
+                    (max(0, int(bar_start + (i + 0.5) * bar_step) - half_bar_w),
+                     min(cw,  int(bar_start + (i + 0.5) * bar_step) + half_bar_w))
+                    for i in range(num_bars)
+                ]
+
+        if not bar_ranges:
+            # No bar region found — equal spacing across full chart width
+            bar_step   = cw / num_bars
+            bar_ranges = [
+                (max(0, int((i + 0.5) * bar_step) - half_bar_w),
+                 min(cw,  int((i + 0.5) * bar_step) + half_bar_w))
+                for i in range(num_bars)
+            ]
             print(f"[pixel] bar region not found — equal spacing fallback (step={bar_step:.1f}px)")
 
         # --- 5. EXTRACT BAR HEIGHTS WITH SUB-PIXEL INTERPOLATION ---
-        COV_THRESH = 0.3   # fraction of bar width that must be colored to count as "bar row"
 
         raw_kwh = []
         for i, label in enumerate(month_labels):
             cs, ce = bar_ranges[i]
 
-            col_slice = is_bar[:, cs:ce]
+            # Search ONLY within plot area — excludes chart title/border rows above top gridline
+            col_slice = is_bar[plot_top:plot_bot, cs:ce]
             row_cov = col_slice.mean(axis=1)
             bar_rows = np.where(row_cov > COV_THRESH)[0]
 
@@ -413,16 +507,28 @@ def pixel_extract_bars(pil_image, meta):
                 raw_kwh.append(None)
                 continue
 
-            # Sub-pixel interpolation of the bar top edge:
-            # find where coverage crosses COV_THRESH between the row above and the first bar row
-            bar_top_idx = int(bar_rows.min())
-            bar_top_float = float(bar_top_idx)
+            # Find the topmost bar row that is part of a SUSTAINED bar region.
+            # Isolated noise pixels near the top (legend marks, borders) are skipped
+            # if they don't have min_run consecutive bar-colored rows below them.
+            min_run = max(3, (plot_bot - plot_top) // 40)
+            bar_top_idx = None
+            for row in bar_rows:
+                end = min(len(row_cov), row + min_run)
+                if np.sum(row_cov[row:end] > COV_THRESH) >= (end - row):
+                    bar_top_idx = row
+                    break
+            if bar_top_idx is None:
+                bar_top_idx = int(bar_rows.min())  # fallback to simple min
+
+            # Sub-pixel interpolation of the bar top edge.
+            # bar_rows indices are relative to plot_top — convert to absolute for row_to_kwh.
+            bar_top_float = float(bar_top_idx + plot_top)
             if bar_top_idx > 0:
                 cov_above = float(row_cov[bar_top_idx - 1])
                 cov_at    = float(row_cov[bar_top_idx])
                 if cov_at > cov_above:
                     t = (COV_THRESH - cov_above) / (cov_at - cov_above)
-                    bar_top_float = float(bar_top_idx - 1) + max(0.0, min(1.0, t))
+                    bar_top_float = float(plot_top + bar_top_idx - 1) + max(0.0, min(1.0, t))
 
             kwh = row_to_kwh(bar_top_float)
             kwh = max(y_min, min(y_max, kwh))
@@ -567,7 +673,9 @@ def parse_history_date(date_str):
 
 def build_monthly_history(raw_history):
     """
-    Takes list of {date, kwh}, keeps most recent 12, returns sorted Jan→Dec.
+    Takes list of {date, kwh}, keeps most recent 12 months in chronological order.
+    Fills gaps (months with no data in the chart) with kwh=null so the table
+    always shows a complete month range.
     Each output row: {month_abbr, month_index, kwh}
     """
     if not raw_history:
@@ -584,10 +692,41 @@ def build_monthly_history(raw_history):
                 "kwh": entry.get("kwh")
             })
 
+    if not parsed:
+        return []
+
     parsed.sort(key=lambda x: (x["year"], x["month_index"]))
     recent = parsed[-12:]
-    recent.sort(key=lambda x: x["month_index"])
-    return recent
+
+    # Fill a full 12-month window ending at the last data point.
+    # This ensures months with no chart data (e.g. Aug/Sep in a rolling history)
+    # still appear as null rows.
+    existing = {(e["year"], e["month_index"]): e for e in recent}
+    end_y,   end_m   = recent[-1]["year"], recent[-1]["month_index"]
+    # Walk back 11 months to find window start
+    start_m, start_y = end_m, end_y
+    for _ in range(11):
+        start_m -= 1
+        if start_m < 0:
+            start_m = 11
+            start_y -= 1
+
+    filled = []
+    y, m = start_y, start_m
+    while (y, m) <= (end_y, end_m):
+        filled.append(existing.get((y, m), {
+            "year": y,
+            "month_index": m,
+            "month_abbr": MONTH_ABBR[m],
+            "kwh": None
+        }))
+        m += 1
+        if m >= 12:
+            m = 0
+            y += 1
+
+    filled.sort(key=lambda x: x["month_index"])
+    return filled
 
 
 def month_from_date(date_str):
