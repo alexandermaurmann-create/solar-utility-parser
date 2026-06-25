@@ -817,12 +817,17 @@ def parse_history_date(date_str):
     return None, None
 
 
-def build_monthly_history(raw_history):
+def build_monthly_history(raw_history, billing_period_end=None):
     """
     Takes list of {date, kwh}, keeps most recent 12 months in chronological order.
     Fills gaps (months with no data in the chart) with kwh=null so the table
     always shows a complete month range.
     Each output row: {month_abbr, month_index, kwh}
+
+    billing_period_end: 'MM/DD/YYYY' string — if provided, anchors the 12-month
+    window to this date so charts with 13 bars (e.g. Mar 25 → Mar 26) don't
+    accidentally include the oldest bar (Mar 25) when the newest bar (Mar 26)
+    is missing from pixel extraction.
     """
     if not raw_history:
         return []
@@ -842,13 +847,35 @@ def build_monthly_history(raw_history):
         return []
 
     parsed.sort(key=lambda x: (x["year"], x["month_index"]))
-    recent = parsed[-12:]
+
+    # Determine window endpoint: prefer billing_period_end over last data point.
+    anchor_y, anchor_m = None, None
+    if billing_period_end:
+        try:
+            dt = datetime.strptime(billing_period_end.strip(), "%m/%d/%Y")
+            anchor_y, anchor_m = dt.year, dt.month - 1
+        except Exception:
+            pass
+
+    if anchor_y is not None:
+        end_y, end_m = anchor_y, anchor_m
+        # Keep only entries within the 12-month window ending at billing period end.
+        start_m, start_y = end_m, end_y
+        for _ in range(11):
+            start_m -= 1
+            if start_m < 0:
+                start_m = 11
+                start_y -= 1
+        recent = [e for e in parsed
+                  if (start_y, start_m) <= (e["year"], e["month_index"]) <= (end_y, end_m)]
+    else:
+        recent = parsed[-12:]
+        end_y, end_m = recent[-1]["year"], recent[-1]["month_index"]
 
     # Fill a full 12-month window ending at the last data point.
     # This ensures months with no chart data (e.g. Aug/Sep in a rolling history)
     # still appear as null rows.
     existing = {(e["year"], e["month_index"]): e for e in recent}
-    end_y,   end_m   = recent[-1]["year"], recent[-1]["month_index"]
     # Walk back 11 months to find window start
     start_m, start_y = end_m, end_y
     for _ in range(11):
@@ -1018,7 +1045,10 @@ def upload():
                     os.remove(p)
 
         month, year = month_from_date(data.get("billing_period_end"))
-        monthly_history = build_monthly_history(data.get("monthly_usage_history") or [])
+        monthly_history = build_monthly_history(
+            data.get("monthly_usage_history") or [],
+            billing_period_end=data.get("billing_period_end")
+        )
 
         if len(group_files) == 1:
             display_name = group_files[0].filename
