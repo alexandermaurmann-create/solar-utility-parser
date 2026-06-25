@@ -104,7 +104,8 @@ Return ONLY this JSON — no markdown, no extra text:
   "month_labels": ["Mar 25", "Apr 25", ...],
   "bar_count": 12,
   "bar_centers_pct": [0.04, 0.11, 0.19, ...],
-  "chart_total_kwh": number or null
+  "chart_total_kwh": number or null,
+  "issuer": "utility company name printed on the bill, lowercase (e.g. elexicon, burlington hydro, toronto hydro), or null"
 }
 
 Definitions:
@@ -120,9 +121,46 @@ Definitions:
   Must have exactly the same number of entries as month_labels.
   Example for 4 bars evenly spaced with padding: [0.10, 0.35, 0.60, 0.85]
 - chart_total_kwh: total kWh value printed near the chart (annual/period total), or null if not shown
+- issuer: the electricity utility that issued the bill, read from the logo/header (e.g. "elexicon", "burlington hydro", "toronto hydro"). Lowercase. null if unclear.
 
 If there is no bar chart, return {"has_bar_chart": false}.
 """
+
+
+# Per-utility overrides that PIN the brittle, non-deterministic parts of chart
+# pixel extraction.  The pixel math is reliable given a correct chart crop, but
+# Claude's per-run crop wobbles (Opus 4.8 has no temperature control), which
+# occasionally truncates the chart and corrupts extraction.  For known utilities
+# we pin the crop region and bar count so extraction is identical every run.
+# Gridline VALUES still come from Claude — it reads y-axis labels reliably; only
+# the geometry is pinned.  Keyed by a substring of the issuer Claude reads.
+# Crop = (left_pct, top_pct, right_pct, bottom_pct).  Calibrated per bill template.
+CHART_PROFILES = {
+    "elexicon": {
+        "chart_crop_pct": (0.20, 0.79, 0.97, 0.965),
+        "bar_count": 13,
+    },
+}
+
+
+def apply_chart_profile(chart_meta):
+    """If the issuer matches a known profile, pin its crop + bar_count so the
+    pixel extraction stops depending on Claude's non-deterministic geometry."""
+    issuer = (chart_meta.get("issuer") or "").lower()
+    for key, prof in CHART_PROFILES.items():
+        if key in issuer:
+            if "chart_crop_pct" in prof:
+                l, t, r, b = prof["chart_crop_pct"]
+                chart_meta["chart_left_pct"]  = l
+                chart_meta["chart_top_pct"]   = t
+                chart_meta["chart_right_pct"] = r
+                chart_meta["chart_bottom_pct"] = b
+            if "bar_count" in prof:
+                chart_meta["bar_count"] = prof["bar_count"]
+            print(f"[profile] applied '{key}': pinned crop + bar_count "
+                  f"(deterministic, ignoring Claude's chart geometry)")
+            return chart_meta
+    return chart_meta
 
 
 def enhance_image(img):
@@ -411,6 +449,12 @@ def pixel_extract_bars(pil_image, meta):
             elif row_to_kwh is None:
                 print("[pixel] gridline calibration failed — falling back to floor detection")
 
+        # Did the gridline-label calibration succeed?  If so it spans the full
+        # y-range and is more accurate than the 2-point bar-bottom calibration
+        # below, so we must NOT let bar-bottom override it (that override placed
+        # Elexicon's zero-line ~900 kWh too high, collapsing summer bars to 0).
+        gridline_ok = row_to_kwh is not None
+
         # --- MASK BAR DETECTION TO CHART PLOT AREA ---
         if gl_candidates:
             plot_top = max(0, int(gl_candidates[0]  * SCALE) - SCALE * 3)
@@ -469,12 +513,48 @@ def pixel_extract_bars(pil_image, meta):
             auto_count = int(is_bar_auto[plot_top:plot_bot, :].sum())
             print(f"[pixel] auto color: RGB({auto_r:.0f},{auto_g:.0f},{auto_b:.0f}), {auto_count} px")
 
+        # --- 3b. TWO-COLOR (STACKED) BAR DETECTION ---
+        # Stacked charts (e.g. Tier1/Tier2) draw each bar in two colors. A single-
+        # colour mask then catches only one tier, leaving short bars (which may be
+        # almost entirely the other tier) too sparse to register as bar columns —
+        # the pipeline mis-counts bars and falls back to misaligned equal spacing.
+        # Detect a distinct second dominant colour and, when the plot area is
+        # genuinely two-tone, mask on the UNION of both tiers.
+        is_bar_two = None
+        if colorful_mask.sum() > 200:
+            pix = np.stack([plot_r[colorful_mask], plot_g[colorful_mask],
+                            plot_b[colorful_mask]], axis=1).astype(float)
+            rng = np.random.default_rng(0)
+            cen = pix[rng.choice(len(pix), 2, replace=False)].astype(float)
+            for _ in range(15):
+                lab = np.linalg.norm(pix[:, None, :] - cen[None], axis=2).argmin(1)
+                for k in range(2):
+                    if (lab == k).any():
+                        cen[k] = pix[lab == k].mean(0)
+            sep = float(np.linalg.norm(cen[0] - cen[1]))
+            n0, n1 = int((lab == 0).sum()), int((lab == 1).sum())
+            frac = min(n0, n1) / max(1, n0 + n1)
+            # Two well-separated, both-substantial colours ⇒ stacked bar chart.
+            if sep > 60 and frac > 0.15:
+                d0 = np.sqrt((r - cen[0, 0])**2 + (g - cen[0, 1])**2 + (b - cen[0, 2])**2)
+                d1 = np.sqrt((r - cen[1, 0])**2 + (g - cen[1, 1])**2 + (b - cen[1, 2])**2)
+                is_bar_two = (d0 < 75) | (d1 < 75)
+                two_count = int(is_bar_two[plot_top:plot_bot, :].sum())
+                print(f"[pixel] two-color stacked chart: "
+                      f"RGB({cen[0,0]:.0f},{cen[0,1]:.0f},{cen[0,2]:.0f})+"
+                      f"RGB({cen[1,0]:.0f},{cen[1,1]:.0f},{cen[1,2]:.0f}), {two_count} px")
+
         # --- 4. BAR COLOR SELECTION ---
         # Priority: Claude fingerprint > auto-detected > generic
         # Prefer whichever is most selective while still covering enough pixels.
         gen_count = int(is_bar_generic[plot_top:plot_bot, :].sum())
 
-        if bar_color and len(bar_color) == 3:
+        if is_bar_two is not None:
+            # Stacked two-tone chart: union of both tiers is the only mask that
+            # captures every bar (short bars may be entirely the second colour).
+            is_bar = is_bar_two
+            print("[pixel] using two-color union mask")
+        elif bar_color and len(bar_color) == 3:
             bc = np.array(bar_color, dtype=float)
             color_dist = np.sqrt((r - bc[0])**2 + (g - bc[1])**2 + (b - bc[2])**2)
             is_bar_fp = color_dist < 80
@@ -634,7 +714,7 @@ def pixel_extract_bars(pil_image, meta):
         # (bottom = x-axis = 0 kWh) in ABSOLUTE zoomed coords.  Because
         # abs_row = crop_z + abs_off is crop-shift-independent, the distance from
         # the top gridline to the x-axis is constant across LLM runs → stable slope.
-        if gl_candidates and bar_ranges:
+        if not gridline_ok and gl_candidates and bar_ranges:
             bb_abs = []
             for cs_b, ce_b in bar_ranges:
                 col_b = is_bar[plot_top:plot_bot, cs_b:ce_b]
@@ -810,13 +890,13 @@ def extract_with_claude(images_b64, pil_images=None):
             meta_response = client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=600,
-                temperature=0,
                 messages=[{
                     "role": "user",
                     "content": image_content + [{"type": "text", "text": CHART_META_PROMPT}]
                 }]
             )
             chart_meta = clean_json(meta_response.content[0].text)
+            chart_meta = apply_chart_profile(chart_meta)
 
             if chart_meta.get("has_bar_chart") and not chart_meta.get("has_printed_numbers", True):
                 page_idx = min(chart_meta.get("page_index", 0), len(pil_images) - 1)
@@ -831,7 +911,6 @@ def extract_with_claude(images_b64, pil_images=None):
     response1 = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=1024,
-        temperature=0,
         messages=[{
             "role": "user",
             "content": image_content + [{"type": "text", "text": EXTRACT_PROMPT}]
@@ -856,7 +935,6 @@ def extract_with_claude(images_b64, pil_images=None):
     response2 = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=3000,
-        temperature=0,
         messages=[{
             "role": "user",
             "content": image_content + [{"type": "text", "text": verify_prompt}]
@@ -869,6 +947,25 @@ def extract_with_claude(images_b64, pil_images=None):
     # Always re-inject pixel history in case Claude changed it despite the note
     if pixel_history:
         verified["monthly_usage_history"] = pixel_history
+
+    # --- ANCHOR CHART TO KNOWN CURRENT-PERIOD TOTAL ---
+    # The newest chart bar is the current billing period, whose kWh we read
+    # directly from the bill (total_kwh).  Evenly-spaced gridlines can make the
+    # pixel calibration lock onto the wrong line as zero, shifting EVERY bar by
+    # a constant (~one grid interval — e.g. Burlington read ~97 kWh low across
+    # the board).  If the newest bar is off from the known total by a plausible
+    # *systematic* amount, correct all bars by that constant offset.
+    if pixel_history and verified.get("total_kwh"):
+        hist = verified["monthly_usage_history"]
+        anchor = verified["total_kwh"]
+        last = hist[-1]["kwh"] if hist and hist[-1].get("kwh") is not None else None
+        if last and anchor and 0.03 * anchor < abs(anchor - last) <= 0.25 * anchor:
+            offset = anchor - last
+            for e in hist:
+                if e.get("kwh") is not None:
+                    e["kwh"] = max(0, round(e["kwh"] + offset))
+            print(f"[anchor] shifted chart by {offset:+.0f} kWh "
+                  f"(newest bar {last}→{anchor} to match bill total)")
 
     return verified
 
