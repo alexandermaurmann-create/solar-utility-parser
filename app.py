@@ -569,13 +569,19 @@ def pixel_extract_bars(pil_image, meta):
 
 
 def clean_json(raw):
-    """Strip markdown fences and parse JSON."""
+    """Strip markdown fences and extract the JSON object even if surrounded by prose."""
     raw = raw.strip()
+    # Strip markdown fences
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
+    # Find outermost { ... } block, ignoring any prose before/after
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
     return json.loads(raw)
 
 
@@ -649,13 +655,15 @@ def extract_with_claude(images_b64, pil_images=None):
     verify_prompt = VERIFY_PROMPT.format(data=json.dumps(data, indent=2)) + verify_note
     response2 = client.messages.create(
         model="claude-opus-4-8",
-        max_tokens=1024,
+        max_tokens=3000,
         messages=[{
             "role": "user",
             "content": image_content + [{"type": "text", "text": verify_prompt}]
         }]
     )
-    verified = clean_json(response2.content[0].text)
+    raw2 = response2.content[0].text
+    print(f"[verify] response ({len(raw2)} chars): {raw2[:200]}")
+    verified = clean_json(raw2)
 
     # Always re-inject pixel history in case Claude changed it despite the note
     if pixel_history:
@@ -853,19 +861,21 @@ def upload():
         group_files = groups[key]
         all_pil, all_b64, tmp_paths = [], [], []
 
-        for f in group_files:
-            tmp_path = f"/tmp/{uuid.uuid4().hex}_{f.filename}"
-            f.save(tmp_path)
-            tmp_paths.append(tmp_path)
-            pil_images, images_b64 = file_to_images(tmp_path)
-            all_pil.extend(pil_images)
-            all_b64.extend(images_b64)
-
         try:
+            for f in group_files:
+                tmp_path = f"/tmp/{uuid.uuid4().hex}_{f.filename}"
+                f.save(tmp_path)
+                tmp_paths.append(tmp_path)
+                pil_images, images_b64 = file_to_images(tmp_path)
+                all_pil.extend(pil_images)
+                all_b64.extend(images_b64)
+
             data = extract_with_claude(all_b64, all_pil)
         except ValueError as e:
+            import traceback; traceback.print_exc()
             return jsonify({"error": str(e)}), 500
         except Exception as e:
+            import traceback; traceback.print_exc()
             label = group_files[0].filename
             return jsonify({"error": f"Failed to process {label}: {str(e)}"}), 500
         finally:
