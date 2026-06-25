@@ -538,10 +538,30 @@ def pixel_extract_bars(pil_image, meta):
                 bar_centers = [(gs + ge) // 2 for gs, ge in bar_groups]
 
                 if pixel_bar_count != num_bars:
-                    print(f"[pixel] trimming month_labels from {num_bars} → {pixel_bar_count} (pixel count)")
-                    month_labels = month_labels[-pixel_bar_count:]
-                    num_bars     = pixel_bar_count
-                    half_bar_w   = max(3, cw // (num_bars * 3))
+                    # If exactly one bar is missing, find the double-sized gap and
+                    # insert an inferred center there — don't trim the oldest label.
+                    missing_inserted = False
+                    if pixel_bar_count == num_bars - 1 and len(bar_centers) >= 2:
+                        steps = [bar_centers[i+1] - bar_centers[i]
+                                 for i in range(len(bar_centers)-1)]
+                        med_step = float(np.median(steps))
+                        for gap_i, step in enumerate(steps):
+                            if step > med_step * 1.5:
+                                inferred_cx = int(bar_centers[gap_i] + med_step)
+                                bar_centers.insert(gap_i + 1, inferred_cx)
+                                print(f"[pixel] missing bar inferred at position {gap_i+1} "
+                                      f"cx={inferred_cx} "
+                                      f"(gap {step:.0f} > 1.5× med {med_step:.0f})")
+                                pixel_bar_count += 1
+                                missing_inserted = True
+                                break
+
+                    if not missing_inserted:
+                        print(f"[pixel] trimming month_labels from {num_bars} → {pixel_bar_count} (pixel count)")
+                        month_labels = month_labels[-pixel_bar_count:]
+                        num_bars     = pixel_bar_count
+
+                    half_bar_w = max(3, cw // (num_bars * 3))
 
                 # Check if one more bar is hiding at the right edge
                 if len(bar_centers) >= 2:
