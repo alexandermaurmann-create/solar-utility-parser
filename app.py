@@ -191,6 +191,46 @@ def pixel_extract_bars(pil_image, meta):
         top    = max(0, int(meta["chart_top_pct"]    * orig_h))
         bottom = min(orig_h, int(meta["chart_bottom_pct"] * orig_h))
 
+        # --- CONTENT-BASED CROP STABILISATION ---
+        # Claude's chart_top_pct / chart_bottom_pct vary between runs, causing the
+        # bar chart to appear at different pixel positions in the crop, which makes
+        # gridline calibration unstable (slope drifts up to ~8%).  Instead, detect
+        # the vertical extent of colorful (bar-coloured) pixels in the full image
+        # using the middle 50 % of the chart columns, then lock top/bottom to that.
+        try:
+            full_arr = np.array(pil_image.convert("RGB"))
+            # Use middle 50 % of chart columns to avoid y-axis lines / right border
+            col_quarter = (right - left) // 4
+            col_lo = left + col_quarter
+            col_hi = right - col_quarter
+            col_lo = max(0, col_lo); col_hi = min(orig_w, col_hi)
+            seg = full_arr[:, col_lo:col_hi].astype(float)
+            seg_r, seg_g, seg_b = seg[:, :, 0], seg[:, :, 1], seg[:, :, 2]
+            md = np.maximum(np.maximum(np.abs(seg_r - seg_g), np.abs(seg_g - seg_b)),
+                            np.abs(seg_r - seg_b))
+            bright = seg_r + seg_g + seg_b
+            is_colorful = (md > 30) & (bright > 60) & (bright < 660)
+            colorful_density = is_colorful.mean(axis=1)   # per row of full image
+            # Search within generous window around Claude's estimate (±30 % of height)
+            margin = max(10, (bottom - top) * 3 // 10)
+            s_top = max(0, top - margin)
+            s_bot = min(orig_h, bottom + margin)
+            density_window = colorful_density[s_top:s_bot]
+            colorful_rows = np.where(density_window > 0.04)[0]
+            if len(colorful_rows) >= 10:
+                c_top = int(colorful_rows.min()) + s_top
+                c_bot = int(colorful_rows.max()) + s_top
+                # Sanity: don't deviate more than 50 % of chart height from Claude
+                h_claude = bottom - top
+                if abs(c_top - top) < h_claude // 2 and abs(c_bot - bottom) < h_claude // 2:
+                    new_top = max(0, c_top - 3)
+                    new_bot = min(orig_h, c_bot + 10)
+                    print(f"[pixel] content-crop: rows {new_top}-{new_bot} "
+                          f"(Claude had {top}-{bottom})")
+                    top, bottom = new_top, new_bot
+        except Exception as _e:
+            print(f"[pixel] content-crop skipped: {_e}")
+
         chart_orig_pil = pil_image.crop((left, top, right, bottom)).convert("RGB")
         orig_ch = chart_orig_pil.height
         orig_cw = chart_orig_pil.width
