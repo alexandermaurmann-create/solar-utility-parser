@@ -191,52 +191,13 @@ def pixel_extract_bars(pil_image, meta):
         top    = max(0, int(meta["chart_top_pct"]    * orig_h))
         bottom = min(orig_h, int(meta["chart_bottom_pct"] * orig_h))
 
-        # --- CONTENT-BASED CROP STABILISATION ---
-        # Claude's chart_top_pct / chart_bottom_pct vary between runs, causing the
-        # bar chart to appear at different pixel positions in the crop, which makes
-        # gridline calibration unstable (slope drifts up to ~8%).  Instead, detect
-        # the vertical extent of colorful (bar-coloured) pixels in the full image
-        # using the middle 50 % of the chart columns, then lock top/bottom to that.
-        try:
-            full_arr = np.array(pil_image.convert("RGB"))
-            # Use middle 50 % of chart columns to avoid y-axis lines / right border
-            col_quarter = (right - left) // 4
-            col_lo = left + col_quarter
-            col_hi = right - col_quarter
-            col_lo = max(0, col_lo); col_hi = min(orig_w, col_hi)
-            seg = full_arr[:, col_lo:col_hi].astype(float)
-            seg_r, seg_g, seg_b = seg[:, :, 0], seg[:, :, 1], seg[:, :, 2]
-            md = np.maximum(np.maximum(np.abs(seg_r - seg_g), np.abs(seg_g - seg_b)),
-                            np.abs(seg_r - seg_b))
-            bright = seg_r + seg_g + seg_b
-            is_colorful = (md > 30) & (bright > 60) & (bright < 660)
-            colorful_density = is_colorful.mean(axis=1)   # per row of full image
-            # Search within generous window around Claude's estimate (±30 % of height)
-            margin = max(10, (bottom - top) * 3 // 10)
-            s_top = max(0, top - margin)
-            s_bot = min(orig_h, bottom + margin)
-            density_window = colorful_density[s_top:s_bot]
-            colorful_rows = np.where(density_window > 0.04)[0]
-            if len(colorful_rows) >= 10:
-                c_top = int(colorful_rows.min()) + s_top
-                c_bot = int(colorful_rows.max()) + s_top
-                # Sanity: don't deviate more than 50 % of chart height from Claude
-                h_claude = bottom - top
-                if abs(c_top - top) < h_claude // 2 and abs(c_bot - bottom) < h_claude // 2:
-                    new_top = max(0, c_top - 3)
-                    new_bot = min(orig_h, c_bot + 10)
-                    print(f"[pixel] content-crop: rows {new_top}-{new_bot} "
-                          f"(Claude had {top}-{bottom})")
-                    top, bottom = new_top, new_bot
-        except Exception as _e:
-            print(f"[pixel] content-crop skipped: {_e}")
-
         chart_orig_pil = pil_image.crop((left, top, right, bottom)).convert("RGB")
         orig_ch = chart_orig_pil.height
         orig_cw = chart_orig_pil.width
 
         # --- 1. ZOOM 3x ---
         SCALE = 3
+        abs_off = top * SCALE   # zoomed pixels from image top to crop top (constant)
         chart_pil = chart_orig_pil.resize(
             (orig_cw * SCALE, orig_ch * SCALE), Image.LANCZOS
         )
@@ -668,7 +629,35 @@ def pixel_extract_bars(pil_image, meta):
             ]
             print(f"[pixel] bar region not found — equal spacing fallback (step={bar_step:.1f}px)")
 
-        # --- 5. EXTRACT BAR HEIGHTS ---
+        # --- 5. BAR-BOTTOM ABSOLUTE CALIBRATION ---
+        # After we know bar x-positions, measure where bar-coloured pixels END
+        # (bottom = x-axis = 0 kWh) in ABSOLUTE zoomed coords.  Because
+        # abs_row = crop_z + abs_off is crop-shift-independent, the distance from
+        # the top gridline to the x-axis is constant across LLM runs → stable slope.
+        if gl_candidates and bar_ranges:
+            bb_abs = []
+            for cs_b, ce_b in bar_ranges:
+                col_b = is_bar[plot_top:plot_bot, cs_b:ce_b]
+                cov_b = col_b.mean(axis=1)
+                bot_rows = np.where(cov_b > COV_THRESH * 0.5)[0]
+                if len(bot_rows) >= 3:
+                    bb_crop_z = float(bot_rows.max() + plot_top)
+                    bb_abs.append(bb_crop_z + abs_off)
+
+            if len(bb_abs) >= max(3, num_bars // 2):
+                x_axis_abs  = float(np.median(bb_abs))
+                top_gl_abs  = float((gl_candidates[0] + top) * SCALE)
+                chart_range = x_axis_abs - top_gl_abs
+                if chart_range > SCALE * 5:   # sanity: chart must be at least 5 unzoomed px
+                    slope_bb     = -(y_max - y_min) / chart_range
+                    intercept_bb = y_max - slope_bb * top_gl_abs
+                    row_to_kwh   = (lambda row, s=slope_bb, i=intercept_bb, off=abs_off:
+                                    float(s * (row + off) + i))
+                    print(f"[pixel] bar-bottom calibration: x_axis_abs={x_axis_abs:.1f} "
+                          f"top_gl_abs={top_gl_abs:.1f} range={chart_range:.1f}px "
+                          f"slope={slope_bb:.4f}")
+
+        # --- 6. EXTRACT BAR HEIGHTS ---
         # Uses center 60% of bar width (avoids anti-aliased edges),
         # gradient refinement of bar top, and sub-pixel interpolation.
 
@@ -821,6 +810,7 @@ def extract_with_claude(images_b64, pil_images=None):
             meta_response = client.messages.create(
                 model="claude-opus-4-8",
                 max_tokens=600,
+                temperature=0,
                 messages=[{
                     "role": "user",
                     "content": image_content + [{"type": "text", "text": CHART_META_PROMPT}]
@@ -841,6 +831,7 @@ def extract_with_claude(images_b64, pil_images=None):
     response1 = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=1024,
+        temperature=0,
         messages=[{
             "role": "user",
             "content": image_content + [{"type": "text", "text": EXTRACT_PROMPT}]
@@ -865,6 +856,7 @@ def extract_with_claude(images_b64, pil_images=None):
     response2 = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=3000,
+        temperature=0,
         messages=[{
             "role": "user",
             "content": image_content + [{"type": "text", "text": verify_prompt}]

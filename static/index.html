@@ -337,6 +337,9 @@
       }
 
       renderTable(data.rows);
+      // Clear the queue so the next upload doesn't re-send already-parsed bills.
+      selectedFiles = [];
+      renderFileList();
     } catch (e) {
       showError("Could not connect to server: " + e.message);
     } finally {
