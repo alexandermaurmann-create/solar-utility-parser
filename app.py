@@ -106,6 +106,7 @@ Return ONLY this JSON — no markdown, no extra text:
   "bar_count": 12,
   "bar_centers_pct": [0.04, 0.11, 0.19, ...],
   "chart_total_kwh": number or null,
+  "current_period_kwh": number or null,
   "issuer": "utility company name printed on the bill, lowercase (e.g. elexicon, burlington hydro, toronto hydro), or null"
 }
 
@@ -122,7 +123,8 @@ Definitions:
   Must have exactly the same number of entries as month_labels.
   Example for 4 bars evenly spaced with padding: [0.10, 0.35, 0.60, 0.85]
 - chart_total_kwh: total kWh value printed near the chart (annual/period total), or null if not shown
-- issuer: the electricity utility that issued the bill, read from the logo/header (e.g. "elexicon", "burlington hydro", "toronto hydro"). Lowercase. null if unclear.
+- current_period_kwh: the kWh for the most recent / current month if printed near the chart (e.g. a "Current month" row, or the newest bar's value). This is the value the newest (right-most) bar represents. null if not shown.
+- issuer: the electricity utility that issued the bill, read from the logo/header (e.g. "elexicon", "burlington hydro", "toronto hydro", "tillsonburg hydro"). Lowercase. null if unclear.
 
 If there is no bar chart, return {"has_bar_chart": false}.
 """
@@ -141,6 +143,12 @@ CHART_PROFILES = {
         "chart_crop_pct": (0.20, 0.79, 0.97, 0.965),
         "bar_count": 13,
     },
+    "tillsonburg": {
+        # 3-colour stacked chart (On/Mid/Off-peak), often a SEPARATE image from
+        # the bill, no printed numbers, faint gridlines. Uses the dedicated
+        # extractor that calibrates from the known current-period total.
+        "extractor": "tillsonburg",
+    },
 }
 
 
@@ -158,8 +166,11 @@ def apply_chart_profile(chart_meta):
                 chart_meta["chart_bottom_pct"] = b
             if "bar_count" in prof:
                 chart_meta["bar_count"] = prof["bar_count"]
-            print(f"[profile] applied '{key}': pinned crop + bar_count "
-                  f"(deterministic, ignoring Claude's chart geometry)")
+            if "extractor" in prof:
+                chart_meta["extractor"] = prof["extractor"]
+            print(f"[profile] applied '{key}'"
+                  + (f" → extractor={prof['extractor']}" if "extractor" in prof
+                     else ": pinned crop + bar_count"))
             return chart_meta
     return chart_meta
 
@@ -852,6 +863,99 @@ def pixel_extract_bars(pil_image, meta):
         return None
 
 
+def extract_tillsonburg_chart(pil_image, total_kwh, month_labels):
+    """
+    Dedicated extractor for the Tillsonburg 3-colour stacked usage chart
+    (On-Peak red / Mid-Peak yellow / Off-Peak green).  The bars have no printed
+    numbers and the gridlines are too faint to calibrate from, so we:
+      - mask the union of the three bar colours,
+      - find the bar columns (drop the legend swatch on the right),
+      - use a shared baseline (0 kWh) = median of column bottoms,
+      - measure each bar's top as the contiguous colour run up from the baseline
+        (ignores stray pixels above/below),
+      - calibrate scale from the known current-period total (newest bar = total).
+    Returns [{"date","kwh"}] like pixel_extract_bars, or None.
+    """
+    try:
+        import numpy as np
+        a = np.array(pil_image.convert("RGB")).astype(int)
+        H, W, _ = a.shape
+        r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
+        ON, MID, OFF = [213, 59, 16], [252, 214, 77], [87, 108, 30]
+
+        def near(c, t=70):
+            return np.sqrt((r - c[0])**2 + (g - c[1])**2 + (b - c[2])**2) < t
+        bar = near(ON) | near(MID) | near(OFF)
+
+        n = len(month_labels)
+        if n == 0 or not total_kwh or total_kwh <= 0:
+            print(f"[tillsonburg] missing inputs: n_labels={n} total_kwh={total_kwh} "
+                  f"— cannot calibrate (need current_period_kwh + month_labels)")
+            return None
+
+        # Resolution-relative thresholds so this works on PNGs and higher-DPI PDFs.
+        min_w = max(5, int(W * 0.006))
+        gap_break = max(6, int(H * 0.025))
+
+        col = bar.sum(0)
+        on = col > max(8, col.max() * 0.12)
+        groups = []
+        s = None
+        for x in range(W):
+            if on[x] and s is None:
+                s = x
+            elif not on[x] and s is not None:
+                groups.append((s, x - 1)); s = None
+        if s is not None:
+            groups.append((s, W - 1))
+
+        groups = [gp for gp in groups if gp[1] - gp[0] >= min_w]
+        if len(groups) < n:
+            print(f"[tillsonburg] only {len(groups)} bar columns, expected {n}")
+            return None
+        groups = sorted(groups)[:n]          # bars are leftmost; legend is right of them
+
+        bottoms = []
+        for (s, e) in groups:
+            rows = np.where(bar[:, s:e+1].mean(1) > 0.3)[0]
+            if len(rows):
+                bottoms.append(int(rows.max()))
+        if not bottoms:
+            return None
+        baseline = int(np.median(bottoms))
+
+        def bar_top(s, e):
+            cov = bar[:, s:e+1].mean(1) > 0.3
+            top = baseline
+            gap = 0
+            for y in range(baseline, -1, -1):
+                if cov[y]:
+                    top = y; gap = 0
+                else:
+                    gap += 1
+                    if gap >= gap_break:
+                        break
+            return top
+
+        tops = [bar_top(s, e) for (s, e) in groups]
+        newest_h = baseline - tops[-1]
+        if newest_h <= 0:
+            return None
+        scale = total_kwh / newest_h
+        print(f"[tillsonburg] baseline={baseline} scale={scale:.2f} kWh/px "
+              f"(newest bar = {total_kwh})")
+        out = []
+        for lab, t in zip(month_labels, tops):
+            kwh = max(0, round((baseline - t) * scale))
+            out.append({"date": f"01 {lab.upper()}", "kwh": kwh})
+            print(f"[tillsonburg] {lab}: top={t} → {kwh} kWh")
+        return out
+    except Exception as e:
+        print(f"[tillsonburg] failed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+
 def clean_json(raw):
     """Strip markdown fences and extract the JSON object even if surrounded by prose."""
     raw = raw.strip()
@@ -891,6 +995,7 @@ def extract_with_claude(images_b64, pil_images=None):
 
     # --- Chart meta pass: determine if pixel analysis is needed ---
     pixel_history = None
+    chart_via_total = False   # True when a calibrate-by-total extractor was used
     if pil_images:
         try:
             meta_response = client.messages.create(
@@ -903,10 +1008,31 @@ def extract_with_claude(images_b64, pil_images=None):
             )
             chart_meta = clean_json(meta_response.content[0].text)
             chart_meta = apply_chart_profile(chart_meta)
+            print(f"[chart meta] has_bar_chart={chart_meta.get('has_bar_chart')} "
+                  f"has_printed_numbers={chart_meta.get('has_printed_numbers')} "
+                  f"page_index={chart_meta.get('page_index')} "
+                  f"issuer={chart_meta.get('issuer')!r} "
+                  f"current_period_kwh={chart_meta.get('current_period_kwh')} "
+                  f"n_labels={len(chart_meta.get('month_labels') or [])} "
+                  f"extractor={chart_meta.get('extractor')}")
 
             if chart_meta.get("has_bar_chart") and not chart_meta.get("has_printed_numbers", True):
                 page_idx = min(chart_meta.get("page_index", 0), len(pil_images) - 1)
-                pixel_history = pixel_extract_bars(pil_images[page_idx], chart_meta)
+                if chart_meta.get("extractor") == "tillsonburg":
+                    # Dedicated 3-colour extractor. Claude's page_index is
+                    # unreliable when the chart is a separate file, so try every
+                    # page and take whichever actually yields the full chart.
+                    labels = chart_meta.get("month_labels") or []
+                    total = chart_meta.get("current_period_kwh")
+                    for pi in range(len(pil_images)):
+                        ph = extract_tillsonburg_chart(pil_images[pi], total, labels)
+                        if ph and len(ph) == len(labels) and len(labels) > 0:
+                            pixel_history = ph
+                            chart_via_total = True   # already scaled to the true total
+                            print(f"[route] tillsonburg chart found on page {pi}")
+                            break
+                else:
+                    pixel_history = pixel_extract_bars(pil_images[page_idx], chart_meta)
                 if pixel_history:
                     print(f"[pixel analysis] extracted {len(pixel_history)} bars")
 
@@ -961,7 +1087,7 @@ def extract_with_claude(images_b64, pil_images=None):
     # a constant (~one grid interval — e.g. Burlington read ~97 kWh low across
     # the board).  If the newest bar is off from the known total by a plausible
     # *systematic* amount, correct all bars by that constant offset.
-    if pixel_history and verified.get("total_kwh"):
+    if pixel_history and verified.get("total_kwh") and not chart_via_total:
         hist = verified["monthly_usage_history"]
         anchor = verified["total_kwh"]
         last = hist[-1]["kwh"] if hist and hist[-1].get("kwh") is not None else None
@@ -1174,27 +1300,15 @@ def upload():
 
     files = request.files.getlist("files")
 
-    # Group files into bills:
-    #   - Each PDF is its own bill (already multi-page internally).
-    #   - PNGs sharing the same filename prefix (digits stripped from the end)
-    #     are treated as pages of one bill, e.g. "hydro1.png" + "hydro2.png"
-    #     → one bill. "jan.png" + "feb.png" → two bills (different prefixes).
-    groups = {}  # key → list of FileStorage objects, preserving upload order
-    group_order = []
-
-    for f in files:
-        ext = f.filename.lower().rsplit(".", 1)[-1]
-        if ext not in ("pdf", "png"):
-            continue
-        if ext == "pdf":
-            key = f.filename          # PDFs never share a group
-        else:
-            base = f.filename.rsplit(".", 1)[0]
-            key = re.sub(r"\d+$", "", base) or base   # strip trailing digits
-        if key not in groups:
-            groups[key] = []
-            group_order.append(key)
-        groups[key].append(f)
+    # All files in a single upload belong to ONE customer record. Some utilities
+    # (e.g. Tillsonburg) put the usage-history chart in a SEPARATE file from the
+    # charges, so we treat every uploaded file (in practice one or two — bill +
+    # chart) as pages of one bill: charges are read from whichever page has them,
+    # the history chart from whichever page has it.
+    valid_files = [f for f in files
+                   if f.filename.lower().rsplit(".", 1)[-1] in ("pdf", "png")]
+    groups = {"__record__": valid_files} if valid_files else {}
+    group_order = ["__record__"] if valid_files else []
 
     bills = []
 
