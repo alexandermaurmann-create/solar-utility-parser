@@ -144,10 +144,14 @@ CHART_PROFILES = {
         "bar_count": 13,
     },
     "tillsonburg": {
-        # 3-colour stacked chart (On/Mid/Off-peak), often a SEPARATE image from
-        # the bill, no printed numbers, faint gridlines. Uses the dedicated
-        # extractor that calibrates from the known current-period total.
-        "extractor": "tillsonburg",
+        # 3-colour stacked chart (On/Mid/Off-peak), separate image, no printed
+        # numbers, faint gridlines → stacked extractor (calibrate-by-total).
+        "extractor": "stacked",
+    },
+    "milton": {
+        # Mixed Tiered (solid green) + TOU (3-colour stacked) monthly bars,
+        # separate image, no printed numbers → same stacked extractor.
+        "extractor": "stacked",
     },
     "guelph": {
         # Single-colour "kWh per day" (daily-average) chart, separate image,
@@ -873,17 +877,17 @@ def pixel_extract_bars(pil_image, meta):
         return None
 
 
-def extract_tillsonburg_chart(pil_image, total_kwh, month_labels):
+def extract_stacked_chart(pil_image, total_kwh, month_labels):
     """
-    Dedicated extractor for the Tillsonburg 3-colour stacked usage chart
-    (On-Peak red / Mid-Peak yellow / Off-Peak green).  The bars have no printed
-    numbers and the gridlines are too faint to calibrate from, so we:
-      - mask the union of the three bar colours,
-      - find the bar columns (drop the legend swatch on the right),
-      - use a shared baseline (0 kWh) = median of column bottoms,
-      - measure each bar's top as the contiguous colour run up from the baseline
-        (ignores stray pixels above/below),
-      - calibrate scale from the known current-period total (newest bar = total).
+    Reusable extractor for stacked / multi-colour MONTHLY bar charts with no
+    printed numbers and faint gridlines (e.g. Tillsonburg's On/Mid/Off-peak,
+    Milton's mixed Tiered + TOU bars).  Auto-detects the bar colours as the
+    union of saturated NON-BLUE pixels (so a blue title bar / legend text is
+    ignored), works for solid OR multi-colour-stacked bars, and:
+      - finds the bar columns (drops the legend swatch on the right),
+      - shared baseline (0 kWh) = median of column bottoms,
+      - each bar's top = contiguous colour run up from the baseline,
+      - calibrates scale from the known current-period total (newest bar = total).
     Returns [{"date","kwh"}] like pixel_extract_bars, or None.
     """
     try:
@@ -891,24 +895,24 @@ def extract_tillsonburg_chart(pil_image, total_kwh, month_labels):
         a = np.array(pil_image.convert("RGB")).astype(int)
         H, W, _ = a.shape
         r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
-        ON, MID, OFF = [213, 59, 16], [252, 214, 77], [87, 108, 30]
-
-        def near(c, t=70):
-            return np.sqrt((r - c[0])**2 + (g - c[1])**2 + (b - c[2])**2) < t
-        bar = near(ON) | near(MID) | near(OFF)
+        maxd = np.maximum(np.maximum(abs(r - g), abs(g - b)), abs(r - b))
+        bright = (r + g + b) / 3.0
 
         n = len(month_labels)
         if n == 0 or not total_kwh or total_kwh <= 0:
-            print(f"[tillsonburg] missing inputs: n_labels={n} total_kwh={total_kwh} "
+            print(f"[stacked] missing inputs: n_labels={n} total_kwh={total_kwh} "
                   f"— cannot calibrate (need current_period_kwh + month_labels)")
             return None
 
-        # Resolution-relative thresholds so this works on PNGs and higher-DPI PDFs.
+        # Bar pixels = coloured, but NOT blue (skips blue title bars / legend text).
+        blueish = (b > r + 20) & (b > g + 20)
+        bar = (maxd > 28) & (bright > 30) & (bright < 238) & ~blueish
+
         min_w = max(5, int(W * 0.006))
         gap_break = max(6, int(H * 0.025))
 
         col = bar.sum(0)
-        on = col > max(8, col.max() * 0.12)
+        on = col > max(8, col.max() * 0.10)
         groups = []
         s = None
         for x in range(W):
@@ -921,7 +925,7 @@ def extract_tillsonburg_chart(pil_image, total_kwh, month_labels):
 
         groups = [gp for gp in groups if gp[1] - gp[0] >= min_w]
         if len(groups) < n:
-            print(f"[tillsonburg] only {len(groups)} bar columns, expected {n}")
+            print(f"[stacked] only {len(groups)} bar columns, expected {n}")
             return None
         groups = sorted(groups)[:n]          # bars are leftmost; legend is right of them
 
@@ -952,16 +956,16 @@ def extract_tillsonburg_chart(pil_image, total_kwh, month_labels):
         if newest_h <= 0:
             return None
         scale = total_kwh / newest_h
-        print(f"[tillsonburg] baseline={baseline} scale={scale:.2f} kWh/px "
+        print(f"[stacked] baseline={baseline} scale={scale:.2f} kWh/px "
               f"(newest bar = {total_kwh})")
         out = []
         for lab, t in zip(month_labels, tops):
             kwh = max(0, round((baseline - t) * scale))
             out.append({"date": f"01 {lab.upper()}", "kwh": kwh})
-            print(f"[tillsonburg] {lab}: top={t} → {kwh} kWh")
+            print(f"[stacked] {lab}: top={t} → {kwh} kWh")
         return out
     except Exception as e:
-        print(f"[tillsonburg] failed: {e}")
+        print(f"[stacked] failed: {e}")
         import traceback; traceback.print_exc()
         return None
 
@@ -1147,8 +1151,8 @@ def extract_with_claude(images_b64, pil_images=None):
                     # whichever actually yields the full chart.
                     labels = chart_meta.get("month_labels") or []
                     for pi in range(len(pil_images)):
-                        if ext == "tillsonburg":
-                            ph = extract_tillsonburg_chart(
+                        if ext == "stacked":
+                            ph = extract_stacked_chart(
                                 pil_images[pi],
                                 chart_meta.get("current_period_kwh"), labels)
                         elif ext == "dailyavg":
