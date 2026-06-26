@@ -65,7 +65,8 @@ Starting from the source base above, the overall score is adjusted by these chec
 
 | Check | Effect |
 |-------|--------|
-| Both extraction passes **agree** on the charges (total + TOU) | no penalty |
+| Charges are **internally consistent** (peaks/tiers sum to the printed total) | no penalty |
+| A second verification pass **ran and agreed** on the charges | no penalty |
 | The two passes **disagree** on a key charge | −8 |
 | Newest bar **matches** the bill's printed current-period total (within ~3%) | no penalty (confirms calibration) |
 | Newest bar **misses** the bill's total by more than ~3% | −7 |
@@ -97,6 +98,7 @@ Alongside the number, the parser shows 2–3 short reasons so the score isn't a 
 e.g.:
 
 - ✓ Newest month matches the bill's total
+- ✓ Charges reconcile (components sum to the total)
 - ✓ Both extraction passes agreed on the charges
 - ⚠ 11 months estimated from chart pixels (not independently verified)
 - ⚠ April's billing-day count looked wrong and was estimated

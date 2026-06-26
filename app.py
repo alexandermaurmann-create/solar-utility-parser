@@ -17,6 +17,14 @@ app = Flask(__name__, static_folder="static")
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
 CORS(app)
 
+# --- Model routing (speed/accuracy balance) ---
+# Detection is an easy structured task -> Haiku (fast/cheap).
+# Number-reading extraction -> Sonnet (strong OCR, much faster than Opus).
+# Verify is a second-opinion re-read; only run when pass-1 looks inconsistent.
+META_MODEL = "claude-haiku-4-5-20251001"
+EXTRACT_MODEL = "claude-sonnet-4-6"
+VERIFY_MODEL = "claude-sonnet-4-6"
+
 MONTH_ORDER = ["January", "February", "March", "April", "May", "June",
                "July", "August", "September", "October", "November", "December"]
 
@@ -1006,11 +1014,13 @@ def finalize_confidence(sig, monthly_history):
     elif method:
         reasons.append("⚠ History estimated by measuring chart bars (not independently verified)")
 
-    if sig.get("agree") is True:
-        reasons.append("✓ Both extraction passes agreed on the charges")
-    elif sig.get("agree") is False:
+    if sig.get("agree") is False:
         overall -= 8
         reasons.append("⚠ The two extraction passes differed on a charge value")
+    elif sig.get("verify_ran"):
+        reasons.append("✓ Both extraction passes agreed on the charges")
+    else:
+        reasons.append("✓ Charges reconcile (components sum to the total)")
 
     if sig.get("anchor_known"):
         if sig.get("anchor_off"):
@@ -1286,7 +1296,7 @@ def extract_with_claude(images_b64, pil_images=None):
     if pil_images:
         try:
             meta_response = client.messages.create(
-                model="claude-opus-4-8",
+                model=META_MODEL,
                 max_tokens=600,
                 messages=[{
                     "role": "user",
@@ -1343,7 +1353,7 @@ def extract_with_claude(images_b64, pil_images=None):
 
     # --- Pass 1: main extraction ---
     response1 = client.messages.create(
-        model="claude-opus-4-8",
+        model=EXTRACT_MODEL,
         max_tokens=1024,
         messages=[{
             "role": "user",
@@ -1399,33 +1409,57 @@ def extract_with_claude(images_b64, pil_images=None):
     if pixel_history:
         data["monthly_usage_history"] = pixel_history
 
-    # --- Pass 2: verification ---
-    if pixel_history:
-        verify_note = (
-            "\n\nIMPORTANT: monthly_usage_history was measured by pixel analysis and is accurate. "
-            "Do NOT change it. Only verify the other numeric fields."
-        )
-    elif data.get("history_is_daily_average"):
-        verify_note = (
-            "\n\nIMPORTANT: monthly_usage_history has already been converted from daily "
-            "averages to MONTHLY totals (daily average × number of days) and is correct. "
-            "Do NOT change the monthly_usage_history values. Only verify the other fields."
-        )
+    # --- Pass 2: verification (conditional) ---
+    # A second model re-read mainly catches digit slips in the charges. When pass 1
+    # is already internally consistent — the total was read AND the TOU/tier
+    # components sum to it — that's a strong signal it's right, so skip the extra
+    # call to save time. Re-verify only when the total is missing or the parts
+    # don't reconcile.
+    _total = data.get("total_kwh")
+    _bt = (data.get("bill_type") or "").upper()
+    if "TIER" in _bt:
+        _parts = [data.get(k) for k in ("tier1_kwh", "tier2_kwh")]
     else:
-        verify_note = ""
+        _parts = [data.get(k) for k in
+                  ("on_peak_kwh", "mid_peak_kwh", "off_peak_kwh", "overnight_kwh")]
+    _parts = [p for p in _parts if isinstance(p, (int, float))]
+    if not _total or not _parts:
+        needs_verify = True
+    else:
+        needs_verify = abs(sum(_parts) - _total) > 0.02 * max(_total, 1)
 
-    verify_prompt = VERIFY_PROMPT.format(data=json.dumps(data, indent=2)) + verify_note
-    response2 = client.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=3000,
-        messages=[{
-            "role": "user",
-            "content": image_content + [{"type": "text", "text": verify_prompt}]
-        }]
-    )
-    raw2 = response2.content[0].text
-    print(f"[verify] response ({len(raw2)} chars): {raw2[:200]}")
-    verified = clean_json(raw2)
+    verify_ran = False
+    if needs_verify:
+        verify_ran = True
+        if pixel_history:
+            verify_note = (
+                "\n\nIMPORTANT: monthly_usage_history was measured by pixel analysis and is accurate. "
+                "Do NOT change it. Only verify the other numeric fields."
+            )
+        elif data.get("history_is_daily_average"):
+            verify_note = (
+                "\n\nIMPORTANT: monthly_usage_history has already been converted from daily "
+                "averages to MONTHLY totals (daily average × number of days) and is correct. "
+                "Do NOT change the monthly_usage_history values. Only verify the other fields."
+            )
+        else:
+            verify_note = ""
+
+        verify_prompt = VERIFY_PROMPT.format(data=json.dumps(data, indent=2)) + verify_note
+        response2 = client.messages.create(
+            model=VERIFY_MODEL,
+            max_tokens=3000,
+            messages=[{
+                "role": "user",
+                "content": image_content + [{"type": "text", "text": verify_prompt}]
+            }]
+        )
+        raw2 = response2.content[0].text
+        print(f"[verify] ran (pass-1 inconsistent); response ({len(raw2)} chars): {raw2[:200]}")
+        verified = clean_json(raw2)
+    else:
+        print(f"[verify] skipped (pass-1 consistent: components sum to total {_total})")
+        verified = dict(data)
 
     # Always re-inject pixel history in case Claude changed it despite the note
     if pixel_history:
@@ -1499,7 +1533,7 @@ def extract_with_claude(images_b64, pil_images=None):
         tou_ok = _close(sum(parts), verified.get("total_kwh"), tol=0.03)
 
     verified["_conf_signals"] = {
-        "method": method, "base": base, "agree": agree,
+        "method": method, "base": base, "agree": agree, "verify_ran": verify_ran,
         "anchor_known": anchor_known, "anchor_off": anchor_off, "tou_ok": tou_ok,
     }
 
@@ -1526,6 +1560,21 @@ def parse_history_date(date_str):
             return dt.year, dt.month - 1
         except ValueError:
             continue
+    # Fallback for messy / billing-period range labels like "Mar 19-25" or
+    # "Feb 19-26" (Elexicon-style "<month> <day>-<yy>"): take the month from the
+    # first alphabetic token and the year from the LAST numeric token (the year
+    # follows the day range — e.g. Jan 19-26 -> 2026, Dec 19-25 -> 2025).
+    nums = re.findall(r"\d+", s)
+    alpha = re.search(r"[A-Za-z]{3,}", s)
+    if alpha and nums:
+        abbr3 = [m.lower() for m in MONTH_ABBR]
+        key = alpha.group(0).lower()[:3]
+        if key in abbr3:
+            yr = int(nums[-1])
+            if yr < 100:
+                yr += 2000
+            if 2000 <= yr <= 2100:
+                return yr, abbr3.index(key)
     return None, None
 
 
