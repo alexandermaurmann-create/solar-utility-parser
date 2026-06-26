@@ -107,7 +107,8 @@ Return ONLY this JSON — no markdown, no extra text:
   "bar_centers_pct": [0.04, 0.11, 0.19, ...],
   "chart_total_kwh": number or null,
   "current_period_kwh": number or null,
-  "issuer": "utility company name printed on the bill, lowercase (e.g. elexicon, burlington hydro, toronto hydro), or null"
+  "issuer": "utility company name printed on the bill, lowercase (e.g. elexicon, burlington hydro, toronto hydro), or null",
+  "hst_number": "the HST / tax registration number printed on the bill (e.g. '86360 3726 RT0001'), or null"
 }
 
 Definitions:
@@ -123,8 +124,9 @@ Definitions:
   Must have exactly the same number of entries as month_labels.
   Example for 4 bars evenly spaced with padding: [0.10, 0.35, 0.60, 0.85]
 - chart_total_kwh: total kWh value printed near the chart (annual/period total), or null if not shown
-- current_period_kwh: the kWh for the most recent / current month if printed near the chart (e.g. a "Current month" row, or the newest bar's value). This is the value the newest (right-most) bar represents. null if not shown.
-- issuer: the electricity utility that issued the bill, read from the logo/header (e.g. "elexicon", "burlington hydro", "toronto hydro", "tillsonburg hydro"). Lowercase. null if unclear.
+- current_period_kwh: the TOTAL kWh used in the current billing period — the value the newest (most recent) history bar represents. Read it from a "Current month" row near the chart if shown, OR compute it from the current bill's electricity usage (e.g. sum the TOU On/Mid/Off-peak kWh, or Tiered Base+Remaining kWh, or the meter "kWh used"). null only if no usage figure appears anywhere.
+- issuer: the electricity utility that issued the bill, read from the logo/header (e.g. "elexicon", "burlington hydro", "toronto hydro", "tillsonburg hydro"). Lowercase. null if unclear. (Some bills omit the brand name — that's fine, return null and rely on hst_number.)
+- hst_number: the HST / GST tax registration number printed on the bill, usually near "HST" or "Reg. no." (e.g. "86360 3726 RT0001"). This identifies the utility even when the brand name is absent. null if not found.
 
 If there is no bar chart, return {"has_bar_chart": false}.
 """
@@ -163,6 +165,12 @@ CHART_PROFILES = {
         # Same daily-average archetype as Guelph, but GRAY bars/gridlines.
         "extractor": "dailyavg",
     },
+    "enova": {
+        # Dual-bar "$ vs kWh" chart, no printed numbers, and the bill shows NO
+        # brand name — so match on the HST number instead of the issuer.
+        "extractor": "dualbar",
+        "hst": "863603726",
+    },
 }
 
 
@@ -170,8 +178,10 @@ def apply_chart_profile(chart_meta):
     """If the issuer matches a known profile, pin its crop + bar_count so the
     pixel extraction stops depending on Claude's non-deterministic geometry."""
     issuer = (chart_meta.get("issuer") or "").lower()
+    hst = re.sub(r"\D", "", chart_meta.get("hst_number") or "")[:9]
     for key, prof in CHART_PROFILES.items():
-        if key in issuer:
+        prof_hst = re.sub(r"\D", "", prof.get("hst", ""))[:9]
+        if (key in issuer) or (prof_hst and hst and prof_hst == hst):
             if "chart_crop_pct" in prof:
                 l, t, r, b = prof["chart_crop_pct"]
                 chart_meta["chart_left_pct"]  = l
@@ -974,6 +984,90 @@ _MONTH_DAYS = {"jan": 31, "feb": 28, "mar": 31, "apr": 30, "may": 31, "jun": 30,
                "jul": 31, "aug": 31, "sep": 30, "oct": 31, "nov": 30, "dec": 31}
 
 
+def extract_dualbar_chart(pil_image, total_kwh, month_labels):
+    """
+    Reusable extractor for dual-bar "$ vs kWh" charts (e.g. Grand Bridge): each
+    month has a DARK bar ($ amount, ignored) and a LIGHT-gray bar (kWh usage).
+    Isolates the light usage bars, measures each as the longest SOLID colour run
+    (so light-gray dashed gridlines / axis-label text don't count), and
+    calibrates from the known current-period total (newest bar = total_kwh).
+    Returns [{"date","kwh"}] or None.
+    """
+    try:
+        import numpy as np
+        a = np.array(pil_image.convert("RGB")).astype(int)
+        H, W, _ = a.shape
+        r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
+        bright = (r + g + b) / 3.0
+        maxd = np.maximum(np.maximum(abs(r - g), abs(g - b)), abs(r - b))
+
+        n = len(month_labels)
+        if n == 0 or not total_kwh or total_kwh <= 0:
+            print(f"[dualbar] missing inputs: n_labels={n} total_kwh={total_kwh}")
+            return None
+
+        # Two gray bar shades (dark $ ~55, light kWh ~190). Take the LIGHT one:
+        # split gray pixels at the midpoint of their brightness range.
+        gray = (maxd < 30) & (bright > 40) & (bright < 215)
+        if gray.sum() < 200:
+            return None
+        gb = bright[gray]
+        split = (float(np.percentile(gb, 20)) + float(np.percentile(gb, 80))) / 2
+        light = (maxd < 30) & (bright > split) & (bright < 218)
+
+        col = light.sum(0)
+        on = col > max(6, col.max() * 0.20)
+        groups = []
+        s = None
+        for x in range(W):
+            if on[x] and s is None:
+                s = x
+            elif not on[x] and s is not None:
+                groups.append((s, x - 1)); s = None
+        if s is not None:
+            groups.append((s, W - 1))
+        groups = [gp for gp in groups if gp[1] - gp[0] >= max(5, int(W * 0.006))]
+        if len(groups) < n:
+            print(f"[dualbar] only {len(groups)} light bars, expected {n}")
+            return None
+        groups = sorted(groups)[:n]
+
+        def longest_run(s, e):
+            cov = light[:, s:e + 1].mean(1) > 0.5
+            best = (0, 0, 0); cur = None
+            for y in range(H):
+                if cov[y]:
+                    if cur is None:
+                        cur = y
+                elif cur is not None:
+                    if y - cur > best[2]:
+                        best = (cur, y - 1, y - cur)
+                    cur = None
+            if cur is not None and H - cur > best[2]:
+                best = (cur, H - 1, H - cur)
+            return best[0], best[1]
+
+        runs = [longest_run(s, e) for (s, e) in groups]
+        baseline = int(np.median([bot for _, bot in runs]))
+        tops = [t for t, _ in runs]
+        newest_h = baseline - tops[-1]
+        if newest_h <= 0:
+            return None
+        scale = total_kwh / newest_h
+        print(f"[dualbar] baseline={baseline} split={split:.0f} scale={scale:.3f} "
+              f"(newest bar = {total_kwh})")
+        out = []
+        for lab, t in zip(month_labels, tops):
+            kwh = max(0, round((baseline - t) * scale))
+            out.append({"date": f"01 {lab.upper()}", "kwh": kwh})
+            print(f"[dualbar] {lab}: top={t} → {kwh} kWh")
+        return out
+    except Exception as e:
+        print(f"[dualbar] failed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+
 def extract_dailyavg_chart(pil_image, month_labels, gridline_values):
     """
     Reusable extractor for single-colour bar charts whose y-axis is a DAILY
@@ -1159,6 +1253,10 @@ def extract_with_claude(images_b64, pil_images=None):
                             ph = extract_dailyavg_chart(
                                 pil_images[pi], labels,
                                 chart_meta.get("y_axis_gridlines"))
+                        elif ext == "dualbar":
+                            ph = extract_dualbar_chart(
+                                pil_images[pi],
+                                chart_meta.get("current_period_kwh"), labels)
                         else:
                             ph = None
                         if ph and len(ph) == len(labels) and len(labels) > 0:
@@ -1291,15 +1389,14 @@ def build_monthly_history(raw_history, billing_period_end=None):
     if anchor_y is not None:
         latest_y = parsed[-1]["year"]
         latest_m = parsed[-1]["month_index"]
-        # If the chart's newest bar extends BEYOND the billing period (e.g. Burlington
-        # shows a Jul 25 bar on a bill ending Jun 25), use the chart's newest bar as
-        # the window end so we don't drop it.  Only anchor to billing_period_end when
-        # the chart's data ends at or before the billing period (e.g. Elexicon 13-bar
-        # chart where the newest bar may be missing from pixel extraction).
-        if (latest_y, latest_m) > (anchor_y, anchor_m):
-            end_y, end_m = latest_y, latest_m
-        else:
-            end_y, end_m = anchor_y, anchor_m
+        # Anchor the 12-month window to the latest ACTUAL data point (the newest
+        # bar). The dedicated extractors reliably capture every bar, so the newest
+        # bar is the true most-recent month — even when billing_period_end is
+        # labelled a month later than the chart (e.g. Enova labels the Sep 11–Oct 11
+        # period as "Sep", so the chart ends Sep 24 while the bill ends Oct 2024).
+        # Anchoring to billing_period_end there invents an empty trailing month and
+        # pushes a real month out of the window.
+        end_y, end_m = latest_y, latest_m
         # Keep only entries within the 12-month window ending at end_y/end_m.
         start_m, start_y = end_m, end_y
         for _ in range(11):
