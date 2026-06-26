@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Solar Utility Bill Parser</title>
+  <title>Glean Utility Bill Parser</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -137,6 +137,12 @@
       overflow-x: auto;
     }
 
+    /* Extracted-data table is now vertical: shrink it to fit its content
+       instead of stretching the value column across the page. */
+    #results-wrap { display: inline-block; max-width: 100%; }
+    #results-wrap table { width: auto; }
+    #results-wrap td:first-child, #results-wrap th:first-child { padding-right: 2.5rem; }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -214,7 +220,12 @@
 </head>
 <body>
 
-<h1>☀️ Solar Utility Bill Parser</h1>
+<div style="text-align:center; margin: 0.5rem 0 0.75rem">
+  <img src="/static/glean-logo.png" alt="Glean"
+       style="height:52px; width:auto"
+       onerror="this.style.display='none'">
+</div>
+<h1>Glean Utility Bill Parser</h1>
 <p class="subtitle">Upload one PDF per billing month — extracts TOU usage &amp; charges automatically</p>
 
 <div class="upload-card">
@@ -232,42 +243,48 @@
 </div>
 
 <div class="results-section" id="results-section" style="display:none">
+  <div style="display:flex; gap:1.5rem; align-items:flex-start; flex-wrap:wrap; justify-content:center">
 
-  <!-- Detail Table -->
-  <div class="results-header">
-    <h2 id="results-title">Extracted Data</h2>
-    <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
-      <button class="btn btn-copy" onclick="copyTable()">📋 Copy for Excel</button>
-      <button class="btn btn-download" onclick="downloadCSV()">⬇️ Download CSV</button>
+    <!-- Detail Table column -->
+    <div style="max-width:340px">
+      <div class="results-header">
+        <h2 id="results-title">Extracted Data</h2>
+        <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
+          <button class="btn btn-copy" onclick="copyTable()">📋 Copy for Excel</button>
+          <button class="btn btn-download" onclick="downloadCSV()">⬇️ Download CSV</button>
+        </div>
+      </div>
+      <div class="table-wrap" id="results-wrap">
+        <table id="results-table">
+          <thead id="results-head"></thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
     </div>
-  </div>
-  <div class="table-wrap">
-    <table id="results-table">
-      <thead id="results-head"></thead>
-      <tbody id="results-body"></tbody>
-    </table>
-  </div>
 
-  <!-- Monthly kWh History Table -->
-  <div class="results-header" id="history-header" style="display:none;margin-top:2rem">
-    <h2>Monthly kWh Usage — Last 12 Months</h2>
-    <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
-      <button class="btn btn-copy" onclick="copyHistory()">📋 Copy for Excel</button>
-      <button class="btn btn-download" onclick="downloadHistoryCSV()">⬇️ Download CSV</button>
+    <!-- Monthly kWh History column -->
+    <div id="history-col" style="display:none; max-width:320px">
+      <div class="results-header">
+        <h2>Monthly kWh Usage — Last 12 Months</h2>
+        <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
+          <button class="btn btn-copy" onclick="copyHistory()">📋 Copy for Excel</button>
+          <button class="btn btn-download" onclick="downloadHistoryCSV()">⬇️ Download CSV</button>
+        </div>
+      </div>
+      <div class="table-wrap" id="history-wrap" style="max-width:300px">
+        <table>
+          <thead>
+            <tr>
+              <th>Month</th>
+              <th>kWh</th>
+            </tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+      </div>
     </div>
-  </div>
-  <div class="table-wrap" id="history-wrap" style="display:none;max-width:300px">
-    <table>
-      <thead>
-        <tr>
-          <th>Month</th>
-          <th>kWh</th>
-        </tr>
-      </thead>
-      <tbody id="history-body"></tbody>
-    </table>
-  </div>
 
+  </div>
 </div>
 
 <div id="status-bar" class="status-bar" style="display:none"></div>
@@ -405,26 +422,33 @@
 
   let currentColumns = [];
 
+  // Formatted value for one field of one bill (used by the transposed layout).
+  function cellValue(r, key) {
+    if (key === "bill_type")    return r.bill_type || "TOU";
+    if (key === "period_start") return r.period_start || '<span class="empty">—</span>';
+    if (key === "period_end")   return r.period_end   || '<span class="empty">—</span>';
+    if (key === "delivery_charge" || key === "regulatory_charge") return fmt(r[key], 2);
+    return fmt(r[key]);
+  }
+
   function renderTable(rows) {
     currentColumns = getColumns(rows);
+    document.getElementById("history-col").style.display = "none";  // reset; shown if history exists
 
-    // Build header
+    // Vertical (transposed) layout: fields run down the left, one value column
+    // per bill — matching the Monthly kWh history table below.
+    const valHeaders = rows.map((r, i) =>
+      r.billing_month
+        ? `${r.billing_month}${r.billing_year ? " " + r.billing_year : ""}`
+        : `Bill ${i + 1}`);
     document.getElementById("results-head").innerHTML =
-      "<tr>" + currentColumns.map(c => `<th>${c.label}</th>`).join("") + "</tr>";
+      "<tr><th>Field</th>" + valHeaders.map(h => `<th>${h}</th>`).join("") + "</tr>";
 
-    // Build rows
-    const tbody = document.getElementById("results-body");
-    tbody.innerHTML = rows.map(r => {
-      const cells = currentColumns.map(c => {
-        if (c.key === "month")      return `<td><strong>${r.billing_month}</strong>${r.billing_year ? " " + r.billing_year : ""}</td>`;
-        if (c.key === "bill_type")  return `<td>${r.bill_type || "TOU"}</td>`;
-        if (c.key === "period_start") return `<td>${r.period_start || '<span class="empty">—</span>'}</td>`;
-        if (c.key === "period_end")   return `<td>${r.period_end   || '<span class="empty">—</span>'}</td>`;
-        if (c.key === "delivery_charge" || c.key === "regulatory_charge")
-          return `<td>${fmt(r[c.key], 2)}</td>`;
-        return `<td>${fmt(r[c.key])}</td>`;
-      });
-      return "<tr>" + cells.join("") + "</tr>";
+    // The "Month" column becomes the value-column header, so skip it as a row.
+    const fieldRows = currentColumns.filter(c => c.key !== "month");
+    document.getElementById("results-body").innerHTML = fieldRows.map(c => {
+      const cells = rows.map(r => `<td>${cellValue(r, c.key)}</td>`).join("");
+      return `<tr><td><strong>${c.label}</strong></td>${cells}</tr>`;
     }).join("");
 
     document.getElementById("results-title").textContent =
@@ -448,17 +472,15 @@
     tbody.innerHTML += `<tr style="font-weight:600;border-top:2px solid #2d3748">
       <td>Total</td><td>${fmt(total)}</td>
     </tr>`;
-    document.getElementById("history-header").style.display = "flex";
-    document.getElementById("history-wrap").style.display = "block";
+    document.getElementById("history-col").style.display = "block";
   }
 
   // --- Copy for Excel (tab-separated) ---
   function copyTable() {
-    const headers = currentColumns.map(c => c.label);
-    const rows = [...document.querySelectorAll("#results-body tr")];
-    const lines = [headers.join("\t")];
-    rows.forEach(tr => {
-      const cells = [...tr.querySelectorAll("td")].map(td => td.textContent.trim().replace("—", ""));
+    const head = [...document.querySelectorAll("#results-head th")].map(th => th.textContent.trim());
+    const lines = [head.join("\t")];
+    [...document.querySelectorAll("#results-body tr")].forEach(tr => {
+      const cells = [...tr.children].map(c => c.textContent.trim().replace("—", ""));
       lines.push(cells.join("\t"));
     });
     navigator.clipboard.writeText(lines.join("\n"))
@@ -468,14 +490,11 @@
 
   // --- Download CSV ---
   function downloadCSV() {
-    const headers = currentColumns.map(c => c.label);
-    const rows = [...document.querySelectorAll("#results-body tr")];
-    const lines = [headers.join(",")];
-    rows.forEach(tr => {
-      const cells = [...tr.querySelectorAll("td")].map(td => {
-        const v = td.textContent.trim().replace("—", "");
-        return v.includes(",") ? `"${v}"` : v;
-      });
+    const esc = v => v.includes(",") ? `"${v}"` : v;
+    const head = [...document.querySelectorAll("#results-head th")].map(th => esc(th.textContent.trim()));
+    const lines = [head.join(",")];
+    [...document.querySelectorAll("#results-body tr")].forEach(tr => {
+      const cells = [...tr.children].map(c => esc(c.textContent.trim().replace("—", "")));
       lines.push(cells.join(","));
     });
     const blob = new Blob([lines.join("\n")], { type: "text/csv" });

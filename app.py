@@ -36,6 +36,7 @@ Extract ONLY these fields and return a single JSON object — no markdown, no ex
   "bill_type": "TOU" or "ULO" or "Tiered",
   "billing_period_start": "MM/DD/YYYY or null",
   "billing_period_end": "MM/DD/YYYY or null",
+  "bill_date": "MM/DD/YYYY or null",
   "on_peak_kwh": number or null,
   "mid_peak_kwh": number or null,
   "off_peak_kwh": number or null,
@@ -63,6 +64,7 @@ Rules:
 - delivery_charge = Delivery charge in dollars (number only, no $ sign)
 - regulatory_charge = Regulatory charge in dollars (number only, no $ sign)
 - billing_period_start/end = meter reading period start and end dates
+- bill_date = the bill's statement / invoice / bill date (look for "Statement", "Invoice Date", "Bill Date", or "Bill Print Date"). Used to label the month when no billing period range is shown.
 - monthly_usage_history = ALL bars from the usage history chart (typically 13-15 entries).
   * Format every date as "DD MMM YY" (e.g. "26 FEB 26"). If dates are shown as "26-Feb-26", convert to "26 Feb 26".
   * Use the billing period END date (read date) as each entry's date.
@@ -1570,7 +1572,11 @@ def upload():
                 if os.path.exists(p):
                     os.remove(p)
 
+        # Billing month: prefer the period end date; fall back to the bill /
+        # statement date when no period range is printed (e.g. Halton, Enova).
         month, year = month_from_date(data.get("billing_period_end"))
+        if not month:
+            month, year = month_from_date(data.get("bill_date"))
         monthly_history = build_monthly_history(
             data.get("monthly_usage_history") or [],
             billing_period_end=data.get("billing_period_end")
