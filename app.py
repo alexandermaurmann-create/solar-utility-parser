@@ -1358,6 +1358,17 @@ def extract_with_claude(images_b64, pil_images=None):
     if data.get("history_is_daily_average") and not pixel_history:
         hist = data.get("monthly_usage_history") or []
         cal = list(_MONTH_DAYS.values())   # calendar days indexed by month 0-11
+        # Sanity guard: real daily averages are small (~5-200/day). If the values are
+        # already in the hundreds/thousands, they're MONTHLY totals despite a "kWh/day"
+        # axis label (e.g. Toronto prints monthly kWh next to a daily-average chart) —
+        # multiplying by days would ~30x them. Treat as already-monthly and skip.
+        raws = sorted(e["kwh"] for e in hist if isinstance(e.get("kwh"), (int, float)))
+        median_raw = raws[len(raws) // 2] if raws else 0
+        if median_raw > 200:
+            print(f"[daily-avg] values already monthly-scale (median {median_raw:.0f}); "
+                  f"NOT multiplying by days")
+            data["history_is_daily_average"] = False
+            hist = []   # skip the conversion loop below
         conv = 0
         for e in hist:
             if e.get("kwh") is None:
