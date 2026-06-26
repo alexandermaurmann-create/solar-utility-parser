@@ -155,6 +155,10 @@ CHART_PROFILES = {
         # off the gridlines and ×days-in-month → monthly kWh.
         "extractor": "dailyavg",
     },
+    "halton": {
+        # Same daily-average archetype as Guelph, but GRAY bars/gridlines.
+        "extractor": "dailyavg",
+    },
 }
 
 
@@ -980,44 +984,61 @@ def extract_dailyavg_chart(pil_image, month_labels, gridline_values):
         a = np.array(pil_image.convert("RGB")).astype(int)
         H, W, _ = a.shape
         r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
-        maxd = np.maximum(np.maximum(abs(r - g), abs(g - b)), abs(r - b))
         bright = (r + g + b) / 3.0
 
         n = len(month_labels)
-        if n == 0:
+        vals = sorted(set(gridline_values or []), reverse=True)   # [150,120,..,0]
+        k = len(vals)
+        if n == 0 or k < 2:
+            print(f"[dailyavg] missing inputs: n_labels={n} gridlines={k}")
             return None
 
-        # Auto-detect the dominant saturated bar colour.
-        sat = (maxd > 50) & (bright > 40) & (bright < 240)
-        if sat.sum() < 200:
-            return None
-        bc = [int(np.median(r[sat])), int(np.median(g[sat])), int(np.median(b[sat]))]
-        bar = np.sqrt((r - bc[0])**2 + (g - bc[1])**2 + (b - bc[2])**2) < 80
-
-        # Calibrate from dark horizontal gridlines spanning the plot width.
-        xs = np.where(bar.any(0))[0]
-        x0, x1 = int(xs.min()), int(xs.max())
-        dark = bright < 110
-        gcov = dark[:, x0:x1].mean(1)
-        gl = [y for y in range(H) if gcov[y] > 0.5]
-        grid_groups = []
-        for y in gl:
-            if not grid_groups or y - grid_groups[-1][-1] > 3:
-                grid_groups.append([y])
+        # Detect dark horizontal gridline rows.
+        dark = bright < 100
+        cov = dark[:, int(W * 0.15):int(W * 0.95)].mean(1)
+        gl_rows = [y for y in range(H) if cov[y] > 0.35]
+        gg = []
+        for y in gl_rows:
+            if not gg or y - gg[-1][-1] > 4:
+                gg.append([y])
             else:
-                grid_groups[-1].append(y)
-        grid = [int(np.mean(c)) for c in grid_groups]
-        if len(grid) < 2:
-            print("[dailyavg] could not detect gridlines")
+                gg[-1].append(y)
+        grid = sorted(int(np.mean(c)) for c in gg)
+        if len(grid) < k:
+            print(f"[dailyavg] found {len(grid)} gridlines, need {k}")
             return None
-        gv = sorted(set(gridline_values or []))
-        interval = (gv[1] - gv[0]) if len(gv) >= 2 else 10
-        px_per_interval = float(np.median(np.diff(sorted(grid))))
-        per_px = interval / px_per_interval
 
-        # Bars.
-        col = bar.sum(0)
-        on = col > max(4, col.max() * 0.05)
+        # Pick the consecutive run of k gridlines with the most even spacing
+        # (drops a title line above or an axis border below).
+        best = None
+        for i in range(len(grid) - k + 1):
+            win = grid[i:i + k]
+            d = np.diff(win)
+            score = float(np.std(d) / (np.mean(d) + 1e-6))
+            if best is None or score < best[0]:
+                best = (score, win)
+        win = best[1]
+        top_row, zero_row = win[0], win[-1]
+        coeffs = np.polyfit(win, vals, 1)          # row → y-axis value (daily avg)
+
+        # Bar fill colour = dominant non-white/non-black pixel in the plot band.
+        band = a[top_row:zero_row + 1, :, :].reshape(-1, 3)
+        bbr = band.mean(1)
+        fill = band[(bbr > 55) & (bbr < 232)]
+        if len(fill) < 200:
+            return None
+        bc = [int(np.median(fill[:, 0])), int(np.median(fill[:, 1])), int(np.median(fill[:, 2]))]
+        bar = np.sqrt((r - bc[0])**2 + (g - bc[1])**2 + (b - bc[2])**2) < 70
+        # Gridlines can be the same gray as the bars — remove them so they don't
+        # read as bar tops spanning every column.
+        for gy in grid:
+            bar[max(0, gy - 1):gy + 2, :] = False
+        barband = np.zeros_like(bar)
+        barband[top_row:zero_row + 1, :] = bar[top_row:zero_row + 1, :]
+
+        # Bar columns within the plot band.
+        col = barband.sum(0)
+        on = col > max(4, col.max() * 0.06)
         groups = []
         s = None
         for x in range(W):
@@ -1027,33 +1048,25 @@ def extract_dailyavg_chart(pil_image, month_labels, gridline_values):
                 groups.append((s, x - 1)); s = None
         if s is not None:
             groups.append((s, W - 1))
-        groups = [gp for gp in groups if gp[1] - gp[0] >= max(6, int(W * 0.01))]
-        if len(groups) < n:
-            print(f"[dailyavg] only {len(groups)} bar columns, expected {n}")
+        groups = [gp for gp in groups if gp[1] - gp[0] >= max(5, int(W * 0.008))]
+
+        def toprow(s, e):
+            ys = np.where(barband[:, s:e + 1].mean(1) > 0.10)[0]
+            return int(ys.min()) if len(ys) else None
+        scored = [(s, e, toprow(s, e)) for (s, e) in groups]
+        scored = [t for t in scored if t[2] is not None]
+        if len(scored) < n:
+            print(f"[dailyavg] only {len(scored)} bar columns, expected {n}")
             return None
-        groups = sorted(groups)[:n]
+        if len(scored) > n:                 # drop shortest extras (axis-label sliver)
+            scored.sort(key=lambda t: zero_row - t[2], reverse=True)
+            scored = scored[:n]
+        scored.sort(key=lambda t: t[0])
 
-        bottoms = [int(np.where(bar[:, s:e+1].mean(1) > 0.1)[0].max())
-                   for (s, e) in groups]
-        baseline = int(np.median(bottoms))
-
-        def bar_top(s, e):
-            cov = bar[:, s:e+1].mean(1) > 0.10
-            top = baseline
-            gap = 0
-            for y in range(baseline, -1, -1):
-                if cov[y]:
-                    top = y; gap = 0
-                else:
-                    gap += 1
-                    if gap >= 10:
-                        break
-            return top
-
-        print(f"[dailyavg] color={bc} baseline={baseline} px/{interval}={px_per_interval:.1f}")
+        print(f"[dailyavg] color={bc} gridlines→{win} (top={vals[0]} zero_row={zero_row})")
         out = []
-        for lab, (s, e) in zip(month_labels, groups):
-            daily = (baseline - bar_top(s, e)) * per_px
+        for lab, (s, e, top) in zip(month_labels, scored):
+            daily = float(np.polyval(coeffs, top))
             days = _MONTH_DAYS.get(lab.strip()[:3].lower(), 30)
             kwh = max(0, round(daily * days))
             out.append({"date": f"01 {lab.upper()}", "kwh": kwh})
