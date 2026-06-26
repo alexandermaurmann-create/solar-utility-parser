@@ -70,7 +70,7 @@ Rules:
 - monthly_usage_history = ALL bars from the usage history chart (typically 13-15 entries). For EACH bar return:
   * "kwh" = the value for that bar EXACTLY as printed/shown — do NOT multiply, convert, or adjust it. (For a daily-average chart this is just the daily-average number, e.g. 46. We will multiply by days ourselves.)
   * "days" = that bar's number of billing days, read from the "# of Days" / "# days" row under the chart. REQUIRED when history_is_daily_average is true; use null otherwise.
-  * "date" = each bar's read/period-end date, formatted "DD MMM YY" (e.g. "26 FEB 26"). Convert "26-Feb-26" → "26 Feb 26".
+  * "date" = each bar's date, formatted "DD MMM YY" (e.g. "26 FEB 26"). ALWAYS include a year. If the chart labels bars with only a month name (e.g. "Apr", "May"), infer each bar's year from the chart's date range or title (e.g. a title "APRIL 2025 - APRIL 2026" means the bars run Apr 2025 → Apr 2026) and output e.g. "01 APR 25". Never return a bare month with no year.
   * Read every bar — do not skip any, and keep them in the chart's order.
 - For fields that don't apply to the detected bill type, use null.
 - ALL numeric values must be plain numbers — NO commas, NO dollar signs, NO units.
@@ -988,6 +988,67 @@ _MONTH_DAYS = {"jan": 31, "feb": 28, "mar": 31, "apr": 30, "may": 31, "jun": 30,
                "jul": 31, "aug": 31, "sep": 30, "oct": 31, "nov": 30, "dec": 31}
 
 
+def _conf_label(score):
+    return "High" if score >= 90 else ("Medium" if score >= 75 else "Review")
+
+
+def finalize_confidence(sig, monthly_history):
+    """Turn the extraction signals + assembled 12-month history into an overall
+    confidence score (+reasons) and per-month conf labels. See CONFIDENCE_SCORING.md.
+    Confidence, NOT measured accuracy — see that doc for the caveats."""
+    base = sig.get("base", 80)
+    overall = base
+    reasons = []
+    method = sig.get("method")
+
+    if method in ("printed", "printed_dailyavg"):
+        reasons.append("✓ Read from numbers printed on the bill")
+    elif method:
+        reasons.append("⚠ History estimated by measuring chart bars (not independently verified)")
+
+    if sig.get("agree") is True:
+        reasons.append("✓ Both extraction passes agreed on the charges")
+    elif sig.get("agree") is False:
+        overall -= 8
+        reasons.append("⚠ The two extraction passes differed on a charge value")
+
+    if sig.get("anchor_known"):
+        if sig.get("anchor_off"):
+            overall -= 7
+            reasons.append("⚠ Newest month doesn't match the bill's current-period total")
+        else:
+            reasons.append("✓ Newest month matches the bill's current-period total")
+
+    if sig.get("tou_ok") is False:
+        overall -= 5
+        reasons.append("⚠ On/Mid/Off-peak don't sum to the total kWh")
+
+    missing = sum(1 for e in (monthly_history or []) if e.get("kwh") is None)
+    if missing:
+        overall -= min(15, missing * 3)
+        reasons.append(f"⚠ {missing} month(s) had no chart bar")
+
+    overall = max(55, min(98, round(overall)))
+
+    # Per-month confidence
+    dated = [e for e in (monthly_history or []) if e.get("kwh") is not None]
+    newest = (max(dated, key=lambda e: (e.get("year", 0), e.get("month_index", 0)))
+              if dated else None)
+    for e in (monthly_history or []):
+        if e.get("kwh") is None:
+            c = 40
+        elif e is newest and sig.get("anchor_known"):
+            c = 96
+        elif e.get("days_fallback"):
+            c = base - 12
+        else:
+            c = base
+        e["conf"] = c
+        e["conf_label"] = _conf_label(c)
+
+    return {"overall": overall, "label": _conf_label(overall), "reasons": reasons[:4]}
+
+
 def extract_dualbar_chart(pil_image, total_kwh, month_labels):
     """
     Reusable extractor for dual-bar "$ vs kWh" charts (e.g. Grand Bridge): each
@@ -1220,6 +1281,8 @@ def extract_with_claude(images_b64, pil_images=None):
     # --- Chart meta pass: determine if pixel analysis is needed ---
     pixel_history = None
     chart_via_total = False   # True when a calibrate-by-total extractor was used
+    _cur_period = None        # confidence: bill's current-period total (anchor check)
+    _ext_type = None          # confidence: which dedicated extractor ran
     if pil_images:
         try:
             meta_response = client.messages.create(
@@ -1232,6 +1295,8 @@ def extract_with_claude(images_b64, pil_images=None):
             )
             chart_meta = clean_json(meta_response.content[0].text)
             chart_meta = apply_chart_profile(chart_meta)
+            _cur_period = chart_meta.get("current_period_kwh")
+            _ext_type = chart_meta.get("extractor")
             print(f"[chart meta] has_bar_chart={chart_meta.get('has_bar_chart')} "
                   f"has_printed_numbers={chart_meta.get('has_printed_numbers')} "
                   f"page_index={chart_meta.get('page_index')} "
@@ -1303,6 +1368,7 @@ def extract_with_claude(images_b64, pil_images=None):
             if not (isinstance(days, (int, float)) and 25 <= days <= 35):
                 _, mi = parse_history_date(e.get("date", ""))
                 days = cal[mi] if mi is not None else 30
+                e["days_fallback"] = True   # confidence: OCR day-count was implausible
             e["kwh"] = round(e["kwh"] * days)
             conv += 1
         # Anchor the newest bar to the bill's exact current-period total (the most
@@ -1376,14 +1442,76 @@ def extract_with_claude(images_b64, pil_images=None):
             print(f"[anchor] shifted chart by {offset:+.0f} kWh "
                   f"(newest bar {last}→{anchor} to match bill total)")
 
+    # --- CONFIDENCE SIGNALS (see CONFIDENCE_SCORING.md) ---
+    def _close(a, b, tol=0.02):
+        if a is None or b is None:
+            return True
+        try:
+            a, b = float(a), float(b)
+        except (TypeError, ValueError):
+            return True
+        if max(abs(a), abs(b)) == 0:
+            return True
+        return abs(a - b) <= tol * max(abs(a), abs(b), 1.0)
+
+    hist = verified.get("monthly_usage_history") or []
+    if not hist:
+        method, base = None, 87                         # charges only, no history chart
+    elif pixel_history:
+        if _ext_type in ("stacked", "dualbar"):
+            method, base = "pixel_anchor", 85
+        else:
+            method, base = "pixel_gridline", 80
+    elif data.get("history_is_daily_average"):
+        method, base = "printed_dailyavg", 90
+    else:
+        method, base = "printed", 93
+
+    agree = all(_close(data.get(k), verified.get(k)) for k in
+                ("total_kwh", "on_peak_kwh", "mid_peak_kwh", "off_peak_kwh", "overnight_kwh"))
+
+    cur = _cur_period or verified.get("total_kwh")
+    dd = [(parse_history_date(e.get("date", "")), e.get("kwh"))
+          for e in hist if e.get("kwh") is not None]
+    dd = [(d, v) for d, v in dd if d[0] is not None]
+    newest_val = max(dd, key=lambda x: x[0])[1] if dd else None
+    # Anchor check only validates PIXEL extractions; printed numbers are read
+    # exactly, so a chart-vs-bill period mismatch shouldn't penalize them.
+    anchor_known = bool(cur and newest_val and method in ("pixel_anchor", "pixel_gridline"))
+    anchor_off = bool(anchor_known and not _close(newest_val, cur, tol=0.03))
+
+    parts = [verified.get(k) for k in
+             ("on_peak_kwh", "mid_peak_kwh", "off_peak_kwh", "overnight_kwh")]
+    parts = [p for p in parts if p is not None]
+    tou_ok = True
+    if parts and verified.get("total_kwh"):
+        tou_ok = _close(sum(parts), verified.get("total_kwh"), tol=0.03)
+
+    verified["_conf_signals"] = {
+        "method": method, "base": base, "agree": agree,
+        "anchor_known": anchor_known, "anchor_off": anchor_off, "tou_ok": tou_ok,
+    }
+
     return verified
 
 
 def parse_history_date(date_str):
-    """Parse '20 MAR 26', '20 MAR 2026', or '26-Feb-26' → (year, month_index 0-11)."""
-    for fmt in ("%d %b %y", "%d %b %Y", "%d-%b-%y", "%d-%b-%Y"):
+    """Parse a wide range of history-bar date labels → (year, month_index 0-11).
+    Handles 'DD MMM YY', 'MMM YY', 'MMM YYYY', 'April 2025', '04/2025',
+    '2025-04', '26-Feb-26', etc."""
+    if not date_str:
+        return None, None
+    s = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", str(date_str).strip(), flags=re.I)
+    s = re.sub(r"\s+", " ", s).replace(",", "")
+    fmts = (
+        "%d %b %y", "%d %b %Y", "%d-%b-%y", "%d-%b-%Y",
+        "%b %y", "%b %Y", "%B %y", "%B %Y",
+        "%b-%y", "%b-%Y", "%b/%y", "%b/%Y",
+        "%m/%Y", "%m-%Y", "%Y-%m", "%m/%d/%Y", "%m/%d/%y",
+    )
+    for fmt in fmts:
         try:
-            dt = datetime.strptime(date_str.strip(), fmt)
+            dt = datetime.strptime(s, fmt)
             return dt.year, dt.month - 1
         except ValueError:
             continue
@@ -1413,7 +1541,8 @@ def build_monthly_history(raw_history, billing_period_end=None):
                 "year": year,
                 "month_index": month_idx,
                 "month_abbr": MONTH_ABBR[month_idx],
-                "kwh": entry.get("kwh")
+                "kwh": entry.get("kwh"),
+                "days_fallback": entry.get("days_fallback"),
             })
 
     if not parsed:
@@ -1624,6 +1753,9 @@ def upload():
             billing_period_end=data.get("billing_period_end")
         )
 
+        # Confidence score (also tags each month in monthly_history with conf/conf_label).
+        confidence = finalize_confidence(data.get("_conf_signals") or {}, monthly_history)
+
         if len(group_files) == 1:
             display_name = group_files[0].filename
         else:
@@ -1646,6 +1778,7 @@ def upload():
             "delivery_charge": data.get("delivery_charge"),
             "regulatory_charge": data.get("regulatory_charge"),
             "monthly_history": monthly_history,
+            "confidence": confidence,
         })
 
         # Release this bill's large image arrays before processing the next one,
