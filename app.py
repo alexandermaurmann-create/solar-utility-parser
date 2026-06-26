@@ -149,6 +149,12 @@ CHART_PROFILES = {
         # extractor that calibrates from the known current-period total.
         "extractor": "tillsonburg",
     },
+    "guelph": {
+        # Single-colour "kWh per day" (daily-average) chart, separate image,
+        # crisp gridlines. Reusable daily-average extractor: reads daily avgs
+        # off the gridlines and ×days-in-month → monthly kWh.
+        "extractor": "dailyavg",
+    },
 }
 
 
@@ -956,6 +962,109 @@ def extract_tillsonburg_chart(pil_image, total_kwh, month_labels):
         return None
 
 
+_MONTH_DAYS = {"jan": 31, "feb": 28, "mar": 31, "apr": 30, "may": 31, "jun": 30,
+               "jul": 31, "aug": 31, "sep": 30, "oct": 31, "nov": 30, "dec": 31}
+
+
+def extract_dailyavg_chart(pil_image, month_labels, gridline_values):
+    """
+    Reusable extractor for single-colour bar charts whose y-axis is a DAILY
+    AVERAGE ("kWh per day", e.g. Guelph / Alectra).  Auto-detects the bar colour,
+    calibrates from the chart's own (crisp) gridlines, reads each bar's daily
+    average, then multiplies by the number of days in that month to return
+    monthly kWh.  gridline_values = labelled y-axis values (only the interval is
+    used).  Returns [{"date","kwh"}] or None.
+    """
+    try:
+        import numpy as np
+        a = np.array(pil_image.convert("RGB")).astype(int)
+        H, W, _ = a.shape
+        r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
+        maxd = np.maximum(np.maximum(abs(r - g), abs(g - b)), abs(r - b))
+        bright = (r + g + b) / 3.0
+
+        n = len(month_labels)
+        if n == 0:
+            return None
+
+        # Auto-detect the dominant saturated bar colour.
+        sat = (maxd > 50) & (bright > 40) & (bright < 240)
+        if sat.sum() < 200:
+            return None
+        bc = [int(np.median(r[sat])), int(np.median(g[sat])), int(np.median(b[sat]))]
+        bar = np.sqrt((r - bc[0])**2 + (g - bc[1])**2 + (b - bc[2])**2) < 80
+
+        # Calibrate from dark horizontal gridlines spanning the plot width.
+        xs = np.where(bar.any(0))[0]
+        x0, x1 = int(xs.min()), int(xs.max())
+        dark = bright < 110
+        gcov = dark[:, x0:x1].mean(1)
+        gl = [y for y in range(H) if gcov[y] > 0.5]
+        grid_groups = []
+        for y in gl:
+            if not grid_groups or y - grid_groups[-1][-1] > 3:
+                grid_groups.append([y])
+            else:
+                grid_groups[-1].append(y)
+        grid = [int(np.mean(c)) for c in grid_groups]
+        if len(grid) < 2:
+            print("[dailyavg] could not detect gridlines")
+            return None
+        gv = sorted(set(gridline_values or []))
+        interval = (gv[1] - gv[0]) if len(gv) >= 2 else 10
+        px_per_interval = float(np.median(np.diff(sorted(grid))))
+        per_px = interval / px_per_interval
+
+        # Bars.
+        col = bar.sum(0)
+        on = col > max(4, col.max() * 0.05)
+        groups = []
+        s = None
+        for x in range(W):
+            if on[x] and s is None:
+                s = x
+            elif not on[x] and s is not None:
+                groups.append((s, x - 1)); s = None
+        if s is not None:
+            groups.append((s, W - 1))
+        groups = [gp for gp in groups if gp[1] - gp[0] >= max(6, int(W * 0.01))]
+        if len(groups) < n:
+            print(f"[dailyavg] only {len(groups)} bar columns, expected {n}")
+            return None
+        groups = sorted(groups)[:n]
+
+        bottoms = [int(np.where(bar[:, s:e+1].mean(1) > 0.1)[0].max())
+                   for (s, e) in groups]
+        baseline = int(np.median(bottoms))
+
+        def bar_top(s, e):
+            cov = bar[:, s:e+1].mean(1) > 0.10
+            top = baseline
+            gap = 0
+            for y in range(baseline, -1, -1):
+                if cov[y]:
+                    top = y; gap = 0
+                else:
+                    gap += 1
+                    if gap >= 10:
+                        break
+            return top
+
+        print(f"[dailyavg] color={bc} baseline={baseline} px/{interval}={px_per_interval:.1f}")
+        out = []
+        for lab, (s, e) in zip(month_labels, groups):
+            daily = (baseline - bar_top(s, e)) * per_px
+            days = _MONTH_DAYS.get(lab.strip()[:3].lower(), 30)
+            kwh = max(0, round(daily * days))
+            out.append({"date": f"01 {lab.upper()}", "kwh": kwh})
+            print(f"[dailyavg] {lab}: {daily:.1f}/day × {days}d → {kwh} kWh")
+        return out
+    except Exception as e:
+        print(f"[dailyavg] failed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+
 def clean_json(raw):
     """Strip markdown fences and extract the JSON object even if surrounded by prose."""
     raw = raw.strip()
@@ -1018,18 +1127,27 @@ def extract_with_claude(images_b64, pil_images=None):
 
             if chart_meta.get("has_bar_chart") and not chart_meta.get("has_printed_numbers", True):
                 page_idx = min(chart_meta.get("page_index", 0), len(pil_images) - 1)
-                if chart_meta.get("extractor") == "tillsonburg":
-                    # Dedicated 3-colour extractor. Claude's page_index is
-                    # unreliable when the chart is a separate file, so try every
-                    # page and take whichever actually yields the full chart.
+                ext = chart_meta.get("extractor")
+                if ext:
+                    # Dedicated extractor. Claude's page_index is unreliable when
+                    # the chart is a separate file, so try every page and take
+                    # whichever actually yields the full chart.
                     labels = chart_meta.get("month_labels") or []
-                    total = chart_meta.get("current_period_kwh")
                     for pi in range(len(pil_images)):
-                        ph = extract_tillsonburg_chart(pil_images[pi], total, labels)
+                        if ext == "tillsonburg":
+                            ph = extract_tillsonburg_chart(
+                                pil_images[pi],
+                                chart_meta.get("current_period_kwh"), labels)
+                        elif ext == "dailyavg":
+                            ph = extract_dailyavg_chart(
+                                pil_images[pi], labels,
+                                chart_meta.get("y_axis_gridlines"))
+                        else:
+                            ph = None
                         if ph and len(ph) == len(labels) and len(labels) > 0:
                             pixel_history = ph
-                            chart_via_total = True   # already scaled to the true total
-                            print(f"[route] tillsonburg chart found on page {pi}")
+                            chart_via_total = True   # self-calibrated; skip offset-anchor
+                            print(f"[route] {ext} chart found on page {pi}")
                             break
                 else:
                     pixel_history = pixel_extract_bars(pil_images[page_idx], chart_meta)
