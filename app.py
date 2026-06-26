@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import gc
 import json
 import base64
 import uuid
@@ -192,7 +193,10 @@ def file_to_images(file_path):
         pil_images.append(original)
         b64_strings.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
     else:
-        pages = convert_from_path(file_path, dpi=300)
+        # 150 DPI keeps plenty of detail for both Claude OCR (which downsamples to
+        # ~1568px anyway) and pixel bar analysis, while using ~1/4 the memory of
+        # 300 DPI — the 300 DPI render was OOM-killing the 512MB Render instance.
+        pages = convert_from_path(file_path, dpi=150)
         for page in pages:
             original = page.convert("RGB")
             enhanced = enhance_image(original.copy())
@@ -200,6 +204,8 @@ def file_to_images(file_path):
             enhanced.save(buf, format="PNG")
             pil_images.append(original)
             b64_strings.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
+            del enhanced, buf          # free the enhanced copy + PNG buffer promptly
+        del pages
 
     return pil_images, b64_strings
 
@@ -1247,6 +1253,11 @@ def upload():
             "regulatory_charge": data.get("regulatory_charge"),
             "monthly_history": monthly_history,
         })
+
+        # Release this bill's large image arrays before processing the next one,
+        # so peak memory stays flat instead of accumulating across bills.
+        del all_pil, all_b64
+        gc.collect()
 
     if not bills:
         return jsonify({"error": "No valid PDF or PNG files found"}), 400
