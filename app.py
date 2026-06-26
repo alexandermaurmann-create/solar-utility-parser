@@ -46,8 +46,9 @@ Extract ONLY these fields and return a single JSON object — no markdown, no ex
   "total_kwh": number or null,
   "delivery_charge": number or null,
   "regulatory_charge": number or null,
+  "history_is_daily_average": true or false,
   "monthly_usage_history": [
-    {"date": "DD MMM YY", "kwh": number},
+    {"date": "DD MMM YY", "kwh": number, "days": number or null},
     ...
   ]
 }
@@ -65,11 +66,12 @@ Rules:
 - regulatory_charge = Regulatory charge in dollars (number only, no $ sign)
 - billing_period_start/end = meter reading period start and end dates
 - bill_date = the bill's statement / invoice / bill date (look for "Statement", "Invoice Date", "Bill Date", or "Bill Print Date"). Used to label the month when no billing period range is shown.
-- monthly_usage_history = ALL bars from the usage history chart (typically 13-15 entries).
-  * Format every date as "DD MMM YY" (e.g. "26 FEB 26"). If dates are shown as "26-Feb-26", convert to "26 Feb 26".
-  * Use the billing period END date (read date) as each entry's date.
-  * If the Y-axis label says "KWH per day" or "Daily Average": look for a "# of Days" row below the chart. For each bar, compute monthly_kwh = round(daily_avg × days). Return the computed total kWh — NOT the raw daily average.
-  * If the Y-axis shows monthly kWh totals: return the bar values directly.
+- history_is_daily_average = true if the usage chart's y-axis is "kWh per day" / "KWH per day" / "Daily Average" / "Avg/Day" (the bars are daily averages). false if the chart shows monthly kWh totals.
+- monthly_usage_history = ALL bars from the usage history chart (typically 13-15 entries). For EACH bar return:
+  * "kwh" = the value for that bar EXACTLY as printed/shown — do NOT multiply, convert, or adjust it. (For a daily-average chart this is just the daily-average number, e.g. 46. We will multiply by days ourselves.)
+  * "days" = that bar's number of billing days, read from the "# of Days" / "# days" row under the chart. REQUIRED when history_is_daily_average is true; use null otherwise.
+  * "date" = each bar's read/period-end date, formatted "DD MMM YY" (e.g. "26 FEB 26"). Convert "26-Feb-26" → "26 Feb 26".
+  * Read every bar — do not skip any, and keep them in the chart's order.
 - For fields that don't apply to the detected bill type, use null.
 - ALL numeric values must be plain numbers — NO commas, NO dollar signs, NO units.
 - If a field is not found, use null. For monthly_usage_history use [] if not found.
@@ -1285,6 +1287,37 @@ def extract_with_claude(images_b64, pil_images=None):
     )
     data = clean_json(response1.content[0].text)
 
+    # Daily-average charts (e.g. Alectra): Claude reads the raw daily averages and
+    # each bar's "# of days"; we convert to monthly totals here deterministically
+    # (the model won't reliably do the multiplication itself).
+    if data.get("history_is_daily_average") and not pixel_history:
+        hist = data.get("monthly_usage_history") or []
+        cal = list(_MONTH_DAYS.values())   # calendar days indexed by month 0-11
+        conv = 0
+        for e in hist:
+            if e.get("kwh") is None:
+                continue
+            days = e.get("days")
+            # Days guardrail: billing periods are ~28-34 days. An out-of-range read
+            # (e.g. 23) is almost certainly an OCR slip → fall back to calendar days.
+            if not (isinstance(days, (int, float)) and 25 <= days <= 35):
+                _, mi = parse_history_date(e.get("date", ""))
+                days = cal[mi] if mi is not None else 30
+            e["kwh"] = round(e["kwh"] * days)
+            conv += 1
+        # Anchor the newest bar to the bill's exact current-period total (the most
+        # recent bar IS the current billing period, whose total the bill prints).
+        total = data.get("total_kwh")
+        dated = [(parse_history_date(e.get("date", "")), e)
+                 for e in hist if e.get("kwh") is not None]
+        dated = [(d, e) for d, e in dated if d[0] is not None]
+        if total and dated:
+            newest = max(dated, key=lambda x: x[0])[1]
+            newest["kwh"] = round(total)
+        if conv:
+            print(f"[daily-avg] converted {conv} bars (days guardrail; "
+                  f"newest anchored to total_kwh={total})")
+
     # Override monthly_history with pixel results if available
     if pixel_history:
         data["monthly_usage_history"] = pixel_history
@@ -1294,6 +1327,12 @@ def extract_with_claude(images_b64, pil_images=None):
         verify_note = (
             "\n\nIMPORTANT: monthly_usage_history was measured by pixel analysis and is accurate. "
             "Do NOT change it. Only verify the other numeric fields."
+        )
+    elif data.get("history_is_daily_average"):
+        verify_note = (
+            "\n\nIMPORTANT: monthly_usage_history has already been converted from daily "
+            "averages to MONTHLY totals (daily average × number of days) and is correct. "
+            "Do NOT change the monthly_usage_history values. Only verify the other fields."
         )
     else:
         verify_note = ""
@@ -1314,6 +1353,9 @@ def extract_with_claude(images_b64, pil_images=None):
     # Always re-inject pixel history in case Claude changed it despite the note
     if pixel_history:
         verified["monthly_usage_history"] = pixel_history
+    elif data.get("history_is_daily_average"):
+        # Use the code-converted (daily × days) history; ignore any change verify made.
+        verified["monthly_usage_history"] = data.get("monthly_usage_history")
 
     # --- ANCHOR CHART TO KNOWN CURRENT-PERIOD TOTAL ---
     # The newest chart bar is the current billing period, whose kWh we read
