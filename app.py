@@ -6,6 +6,7 @@ import json
 import base64
 import uuid
 from itertools import combinations
+from collections import Counter
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for
 from flask_cors import CORS
@@ -98,6 +99,40 @@ Please re-read the image carefully and verify every number. Pay special attentio
 
 Return the corrected JSON object with the same structure. If a value was correct, keep it. If you spot an error, fix it. Return ONLY the JSON object, no other text.
 """
+
+HISTORY_PROMPT = """This utility bill shows a usage-history list/chart where each row has a DATE (often a meter "Read Date") and a kWh value printed next to it.
+
+Transcribe EVERY row exactly as printed — do not measure bar heights, do not round, do not skip duplicates. If two rows share the same month (e.g. two reads in October), include BOTH as separate entries.
+
+Return ONLY this JSON object, no markdown, no other text:
+{"history": [{"date": "DD MMM YY", "kwh": number}, ...]}
+
+Rules:
+- The kWh value is the PRINTED NUMBER shown for that row (e.g. in a "kWh Usage" column). READ THE DIGITS. Do NOT estimate it from the length of any bar.
+- "date": the row's date, formatted "DD MMM YY" with the year (e.g. "31 OCT 25"). If only a month is shown, use day 01 and infer the year from the chart's range.
+- "kwh": the kWh value printed for that row, EXACTLY as shown (strip commas; e.g. "1,903" -> 1903). Read each digit carefully — distinguish 6/8, 1/7, 3/8, 5/6, 0/8.
+- Include all rows, newest or oldest order is fine.
+"""
+
+HISTORY_BBOX_PROMPT = """Find the USAGE-HISTORY chart on this utility bill: a tall list of roughly 12-15 rows, each row a DATE (often a meter "Read Date") with a kWh value and usually a small horizontal bar. It is often titled something like "Compare Your Daily Usage" or "Usage History".
+
+Do NOT return:
+- the single current meter-reading row / billing summary (one row, e.g. "kWh Used 1438") — usually near the bottom of the bill,
+- a small grouped bar chart comparing this period vs last year (e.g. "Time-of-Use Comparison"),
+- the electricity charges breakdown.
+
+Return ONLY the bounding box of that MANY-ROW history list as fractions of the page (0.0-1.0), tight around all its rows and including both the date column and the kWh-value column:
+{"top": 0.0-1.0, "bottom": 0.0-1.0, "left": 0.0-1.0, "right": 0.0-1.0, "row_count": <approx number of rows>}
+
+If there is no such multi-row history list, return {}. No markdown, no other text.
+"""
+
+# Fallback crop boxes (page fractions) for the usage-history table, by issuer
+# substring. Used only when the model's locate step fails or is rejected. Toronto
+# Hydro's "Compare Your Daily Usage" list sits in the top-right of the bill.
+HISTORY_TABLE_BOXES = {
+    "toronto hydro": {"top": 0.0, "bottom": 0.42, "left": 0.55, "right": 1.0},
+}
 
 CHART_META_PROMPT = """Analyze the usage history bar chart in this utility bill image.
 
@@ -1268,6 +1303,207 @@ def clean_json(raw):
     return json.loads(raw)
 
 
+def _hist_key(date_str):
+    """Normalize a history-row date to (year, month_index, day) so the same row
+    can be matched across independent transcriptions. day defaults to 15 for
+    month-only labels (which never collide within a month)."""
+    y, m = parse_history_date(date_str)
+    if y is None:
+        return None
+    dm = re.match(r"\s*(\d{1,2})[\s\-/](?=[A-Za-z])", str(date_str))
+    day = int(dm.group(1)) if dm else 15
+    return (y, m, day)
+
+
+def locate_history_table(client, image_content):
+    """Ask the model for the bounding box (page fractions) of the date+kWh history
+    table. Returns {top,bottom,left,right} or None. This is more reliable than the
+    bar-chart plot box, which can land on a different chart (e.g. Toronto Hydro's
+    lower Time-of-Use comparison) instead of the printed read-date table."""
+    try:
+        resp = client.messages.create(
+            model=EXTRACT_MODEL,   # Sonnet localizes the table far better than Haiku
+            max_tokens=200,
+            messages=[{"role": "user",
+                       "content": image_content + [{"type": "text", "text": HISTORY_BBOX_PROMPT}]}],
+        )
+        box = clean_json(resp.content[0].text)
+        if not isinstance(box, dict):
+            return None
+        keys = ("top", "bottom", "left", "right")
+        if not all(isinstance(box.get(k), (int, float)) for k in keys):
+            return None
+        # Guard: the history list has many rows. A box the model claims holds only a
+        # row or two is the single meter-reading summary, not the history — reject it.
+        rc = box.get("row_count")
+        if isinstance(rc, (int, float)) and rc < 6:
+            print(f"[history-consensus] locate rejected: row_count={rc} (too few rows)")
+            return None
+        return {k: float(box[k]) for k in keys}
+    except Exception as e:
+        print(f"[history-consensus] table-locate failed: {e}")
+        return None
+
+
+def crop_history_region(pil_image, box, upscale=2.5, save_path=None):
+    """Crop the usage-history table out of the full-res original page and zoom in,
+    so the small printed kWh column resolves clearly for OCR (and there are no bars
+    left in frame to estimate from). `box` is {top,bottom,left,right} page fractions.
+    Returns a base64 PNG, or None on failure."""
+    try:
+        if not box:
+            return None
+        W, H = pil_image.size
+        l, t = box.get("left"), box.get("top")
+        r, b = box.get("right"), box.get("bottom")
+        if None in (l, t, r, b):
+            return None
+        # Light padding so nothing on the edges gets clipped.
+        l = max(0.0, l - 0.03); t = max(0.0, t - 0.03)
+        r = min(1.0, r + 0.03); b = min(1.0, b + 0.03)
+        if r - l < 0.05 or b - t < 0.03:
+            return None
+        box_px = (int(l * W), int(t * H), int(r * W), int(b * H))
+        crop = pil_image.crop(box_px).convert("RGB")
+        if upscale and upscale > 1:
+            crop = crop.resize((int(crop.width * upscale), int(crop.height * upscale)),
+                               Image.LANCZOS)
+        if save_path:
+            try:
+                crop.save(save_path)
+                print(f"[history-consensus] saved crop for inspection: {save_path} "
+                      f"(box pct L{l:.2f} T{t:.2f} R{r:.2f} B{b:.2f})")
+            except Exception:
+                pass
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"[history-consensus] crop failed: {e}")
+        return None
+
+
+def reconcile_printed_history(client, image_content, base_history, total_kwh=None,
+                              focus_b64=None):
+    """Majority-vote the PRINTED usage-history kWh values across independent reads.
+
+    Printed numbers are ground truth, but a single transcription occasionally
+    digit-slips (e.g. reads 1903 as 1685). Slips are uncorrelated between reads,
+    so we re-transcribe the history a second time and, only if it disagrees with
+    the first pass, a third time, then take the per-row majority. Agreement after
+    two reads early-exits (one extra API call in the common case).
+
+    base_history: [{date, kwh}] from the main extraction pass (this is vote 1).
+    Returns a corrected [{date, kwh}] in base_history's order. On any failure it
+    returns base_history unchanged, so this can only improve accuracy.
+    """
+    if not base_history:
+        return base_history
+
+    print(f"[history-consensus] running on {len(base_history)} rows"
+          + (" (zoomed crop)" if focus_b64 else " (full page)"))
+
+    # Re-read against the zoomed crop when available — the digits are far more
+    # legible there — otherwise fall back to the full-page image.
+    crop_content = ([{"type": "image",
+                      "source": {"type": "base64", "media_type": "image/png",
+                                 "data": focus_b64}}] if focus_b64 else None)
+
+    def _read_once(temperature, content):
+        try:
+            resp = client.messages.create(
+                model=EXTRACT_MODEL,
+                max_tokens=1024,
+                temperature=temperature,   # >0 decorrelates digit slips between reads
+                messages=[{"role": "user",
+                           "content": content + [{"type": "text", "text": HISTORY_PROMPT}]}],
+            )
+            parsed = clean_json(resp.content[0].text)
+            if isinstance(parsed, dict):
+                parsed = (parsed.get("monthly_usage_history")
+                          or parsed.get("history") or [])
+            rows = parsed if isinstance(parsed, list) else []
+            print(f"[history-consensus]   read returned {len(rows)} rows")
+            return rows
+        except Exception as e:
+            print(f"[history-consensus]   read failed: {e}")
+            return []
+
+    # The crop should contain most of the history rows. If a crop read returns far
+    # fewer (e.g. it landed on the single meter-reading row), it's not the history
+    # table — fall back to the full page rather than trusting a 1-row crop.
+    min_crop_rows = max(5, len(base_history) // 2)
+
+    def _reread(temperature):
+        if crop_content is not None:
+            rows = _read_once(temperature, crop_content)
+            if len(rows) >= min_crop_rows:
+                return rows
+            print(f"[history-consensus]   crop gave {len(rows)} rows "
+                  f"(<{min_crop_rows}) -> retrying on full page")
+        return _read_once(temperature, image_content)
+
+    def _tally(rows, votes):
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            k = _hist_key(r.get("date", ""))
+            v = r.get("kwh")
+            if k is None or not isinstance(v, (int, float)):
+                continue
+            votes.setdefault(k, []).append(int(round(v)))
+
+    # The base read comes from the whole page and tends to ESTIMATE these values
+    # from bar length, so it's the least reliable source for printed digits. The
+    # focused re-reads look at the zoomed number column, where there are no bars to
+    # estimate from. So we take THREE focused re-reads and majority-vote among them;
+    # the base read is only a fallback for rows the re-reads don't return.
+    rr_votes = {}
+    for temp in (0.4, 0.7, 1.0):
+        _tally(_reread(temp), rr_votes)
+    base_votes = {}
+    _tally(base_history, base_votes)
+
+    # Show the ballot so disagreements are visible in the logs.
+    for r in base_history:
+        k = _hist_key(r.get("date", ""))
+        if k and k in rr_votes and len(set(rr_votes[k])) > 1:
+            print(f"[history-consensus]   split {r.get('date')}: re-read votes {rr_votes[k]}")
+
+    out, changed = [], 0
+    for r in base_history:
+        k = _hist_key(r.get("date", ""))
+        cur = r.get("kwh")
+        # Prefer the majority of the focused re-reads; fall back to the base value.
+        if k is not None and k in rr_votes:
+            winner = Counter(rr_votes[k]).most_common(1)[0][0]
+        else:
+            out.append(r)
+            continue
+        if isinstance(cur, (int, float)) and winner != int(round(cur)):
+            changed += 1
+            print(f"[history-consensus] {r.get('date')}: {int(round(cur))} -> {winner} "
+                  f"(re-read votes {rr_votes[k]})")
+        out.append({**r, "kwh": winner})
+
+    # Deterministic anchor: the newest row equals the bill's current-period total,
+    # which is read from the charges section — a different, more reliable region of
+    # the bill than the chart. Trust it over any chart transcription.
+    if isinstance(total_kwh, (int, float)) and out:
+        keyed = [(_hist_key(r.get("date", "")), r) for r in out]
+        keyed = [(k, r) for k, r in keyed if k is not None]
+        if keyed:
+            _, newest = max(keyed, key=lambda kr: kr[0])
+            if newest.get("kwh") != int(round(total_kwh)):
+                print(f"[history-consensus] anchor newest {newest.get('date')}: "
+                      f"{newest.get('kwh')} -> {int(round(total_kwh))} (bill total)")
+                newest["kwh"] = int(round(total_kwh))
+
+    if changed:
+        print(f"[history-consensus] corrected {changed} row(s) by majority vote")
+    return out
+
+
 def extract_with_claude(images_b64, pil_images=None):
     """
     Extract bill data from images using Claude.
@@ -1290,9 +1526,11 @@ def extract_with_claude(images_b64, pil_images=None):
 
     # --- Chart meta pass: determine if pixel analysis is needed ---
     pixel_history = None
+    chart_meta = {}           # chart geometry (crop box, page) from the meta pass
     chart_via_total = False   # True when a calibrate-by-total extractor was used
     _cur_period = None        # confidence: bill's current-period total (anchor check)
     _ext_type = None          # confidence: which dedicated extractor ran
+    _has_printed = False      # chart prints its kWh values as text (consensus path)
     if pil_images:
         try:
             meta_response = client.messages.create(
@@ -1307,6 +1545,7 @@ def extract_with_claude(images_b64, pil_images=None):
             chart_meta = apply_chart_profile(chart_meta)
             _cur_period = chart_meta.get("current_period_kwh")
             _ext_type = chart_meta.get("extractor")
+            _has_printed = bool(chart_meta.get("has_printed_numbers"))
             print(f"[chart meta] has_bar_chart={chart_meta.get('has_bar_chart')} "
                   f"has_printed_numbers={chart_meta.get('has_printed_numbers')} "
                   f"page_index={chart_meta.get('page_index')} "
@@ -1361,6 +1600,35 @@ def extract_with_claude(images_b64, pil_images=None):
         }]
     )
     data = clean_json(response1.content[0].text)
+
+    # Printed-number history: the kWh values are printed as text (ground truth), but
+    # a single read occasionally digit-slips. Re-transcribe and majority-vote the
+    # history so those slips can't reach the table. Pixel/estimated charts skip this
+    # (they have their own dedicated extractors and aren't transcriptions).
+    if _has_printed and not pixel_history and (data.get("monthly_usage_history") or []):
+        focus_b64 = None
+        if pil_images:
+            pidx = min(chart_meta.get("page_index", 0) or 0, len(pil_images) - 1)
+            box = locate_history_table(client, image_content)
+            if not box:
+                # Locate failed/rejected — fall back to a known per-issuer box.
+                issuer = (chart_meta.get("issuer") or "").lower()
+                for name, b in HISTORY_TABLE_BOXES.items():
+                    if name in issuer:
+                        box = b
+                        print(f"[history-consensus] using profile box for '{name}'")
+                        break
+            print(f"[history-consensus] table box: {box}")
+            focus_b64 = crop_history_region(
+                pil_images[pidx], box,
+                save_path=os.path.join(os.path.dirname(__file__), "_history_crop.png"),
+            )
+        data["monthly_usage_history"] = reconcile_printed_history(
+            client, image_content,
+            data.get("monthly_usage_history") or [],
+            total_kwh=data.get("total_kwh"),
+            focus_b64=focus_b64,
+        )
 
     # Daily-average charts (e.g. Alectra): Claude reads the raw daily averages and
     # each bar's "# of days"; we convert to monthly totals here deterministically
@@ -1595,12 +1863,20 @@ def build_monthly_history(raw_history, billing_period_end=None):
 
     parsed = []
     for entry in raw_history:
-        year, month_idx = parse_history_date(entry.get("date", ""))
+        date_str = entry.get("date", "")
+        year, month_idx = parse_history_date(date_str)
         if year is not None:
+            # Day-of-month, used only to order two reads that fall in the same
+            # calendar month (e.g. 07 Oct vs 31 Oct) so the earlier read keeps the
+            # month and the later one rolls forward. Day-less labels ("Mar 25")
+            # sort mid-month, which is fine since they never collide.
+            dm = re.match(r"\s*(\d{1,2})[\s\-/](?=[A-Za-z])", str(date_str))
+            day = int(dm.group(1)) if dm else 15
             parsed.append({
                 "year": year,
                 "month_index": month_idx,
                 "month_abbr": MONTH_ABBR[month_idx],
+                "day": day,
                 "kwh": entry.get("kwh"),
                 "days_fallback": entry.get("days_fallback"),
             })
@@ -1608,7 +1884,30 @@ def build_monthly_history(raw_history, billing_period_end=None):
     if not parsed:
         return []
 
-    parsed.sort(key=lambda x: (x["year"], x["month_index"]))
+    parsed.sort(key=lambda x: (x["year"], x["month_index"], x["day"]))
+
+    # Meter-read history charts (e.g. Toronto Hydro's "Read Date" usage list) label
+    # each bar by the date the meter was read, and that date drifts within a month.
+    # Two reads can land in the same calendar month — e.g. 07 Oct and 31 Oct — which
+    # would collapse into one bucket and leave the following month (Nov) blank. Each
+    # read is one ~monthly billing period, so enforce strictly-increasing month
+    # buckets: when an entry's month is already taken by an earlier read, advance it
+    # to the next month. Charts that already have exactly one bar per month are
+    # strictly increasing, so this is a no-op for them.
+    def _next_month(y, m):
+        m += 1
+        if m >= 12:
+            m, y = 0, y + 1
+        return y, m
+
+    last_ym = None
+    for e in parsed:
+        ym = (e["year"], e["month_index"])
+        if last_ym is not None and ym <= last_ym:
+            ym = _next_month(*last_ym)
+        e["year"], e["month_index"] = ym
+        e["month_abbr"] = MONTH_ABBR[ym[1]]
+        last_ym = ym
 
     # Determine window endpoint: prefer billing_period_end over last data point.
     anchor_y, anchor_m = None, None
@@ -1682,6 +1981,19 @@ def month_from_date(date_str):
         return dt.strftime("%B"), dt.year
     except Exception:
         return None, None
+
+
+def fmt_date_display(date_str):
+    """Convert 'MM/DD/YYYY' -> 'Jun 29, 2026' for display.
+    Returns '' for empty input and passes the original string through unchanged
+    if it can't be parsed."""
+    if not date_str:
+        return ""
+    try:
+        dt = datetime.strptime(str(date_str).strip(), "%m/%d/%Y")
+        return dt.strftime("%b %d, %Y")
+    except Exception:
+        return date_str
 
 
 def build_sorted_rows(bills):
@@ -1826,8 +2138,8 @@ def upload():
             "bill_type": data.get("bill_type", "TOU"),
             "billing_month": month or "Unknown",
             "billing_year": year or 0,
-            "period_start": data.get("billing_period_start") or "",
-            "period_end": data.get("billing_period_end") or "",
+            "period_start": fmt_date_display(data.get("billing_period_start")),
+            "period_end": fmt_date_display(data.get("billing_period_end")),
             "on_peak_kwh": data.get("on_peak_kwh"),
             "mid_peak_kwh": data.get("mid_peak_kwh"),
             "off_peak_kwh": data.get("off_peak_kwh"),
