@@ -502,33 +502,61 @@
     });
   }
 
-  // All columns always shown for consistent copy/paste into Excel
+  // All rows always shown for consistent copy/paste into Excel. The three bill
+  // types (TOU, ULO, Tiered) each get their OWN component rows so a given column
+  // lines up the same way every time — only the rows matching this bill's type are
+  // filled; the rest stay blank.
   function getColumns(rows) {
     return [
       { key: "month",             label: "Month" },
       { key: "bill_type",         label: "Bill Type" },
       { key: "period_start",      label: "Period Start" },
       { key: "period_end",        label: "Period End" },
-      { key: "on_peak_kwh",       label: "On Peak (kWh)" },
-      { key: "mid_peak_kwh",      label: "Mid Peak (kWh)" },
-      { key: "off_peak_kwh",      label: "Off Peak (kWh)" },
-      { key: "overnight_kwh",     label: "Overnight (kWh)" },
-      { key: "tier1_kwh",         label: "Lower Tier (kWh)" },
-      { key: "tier2_kwh",         label: "Higher Tier (kWh)" },
+      { key: "tou_on_peak",       label: "TOU On Peak (kWh)" },
+      { key: "tou_mid_peak",      label: "TOU Mid Peak (kWh)" },
+      { key: "tou_off_peak",      label: "TOU Off Peak (kWh)" },
+      { key: "ulo_on_peak",       label: "ULO On Peak (kWh)" },
+      { key: "ulo_mid_peak",      label: "ULO Mid Peak (kWh)" },
+      { key: "ulo_off_peak",      label: "ULO Off Peak (kWh)" },
+      { key: "ulo_overnight",     label: "ULO Overnight (kWh)" },
+      { key: "tiered_lower",      label: "TIERED Lower Tier (kWh)" },
+      { key: "tiered_higher",     label: "TIERED Higher Tier (kWh)" },
       { key: "total_kwh",         label: "Total (kWh)" },
       { key: "delivery_charge",   label: "Delivery Charge ($)" },
       { key: "regulatory_charge", label: "Regulatory Charge ($)" },
     ];
   }
 
+  // Maps each type-specific row to (bill type it belongs to, underlying data field).
+  // TOU and ULO share the same on/mid/off-peak data fields but display in separate
+  // rows depending on the bill's detected type.
+  const TYPE_ROW_MAP = {
+    tou_on_peak:   ["TOU", "on_peak_kwh"],
+    tou_mid_peak:  ["TOU", "mid_peak_kwh"],
+    tou_off_peak:  ["TOU", "off_peak_kwh"],
+    ulo_on_peak:   ["ULO", "on_peak_kwh"],
+    ulo_mid_peak:  ["ULO", "mid_peak_kwh"],
+    ulo_off_peak:  ["ULO", "off_peak_kwh"],
+    ulo_overnight: ["ULO", "overnight_kwh"],
+    tiered_lower:  ["TIERED", "tier1_kwh"],
+    tiered_higher: ["TIERED", "tier2_kwh"],
+  };
+
   let currentColumns = [];
 
   // Formatted value for one field of one bill (used by the transposed layout).
   function cellValue(r, key) {
+    const blank = '<span class="empty">—</span>';
     if (key === "bill_type")    return r.bill_type || "TOU";
-    if (key === "period_start") return r.period_start || '<span class="empty">—</span>';
-    if (key === "period_end")   return r.period_end   || '<span class="empty">—</span>';
+    if (key === "period_start") return r.period_start || blank;
+    if (key === "period_end")   return r.period_end   || blank;
     if (key === "delivery_charge" || key === "regulatory_charge") return fmt(r[key], 2);
+    // Type-specific component rows: only fill the rows matching this bill's type.
+    if (TYPE_ROW_MAP[key]) {
+      const [type, field] = TYPE_ROW_MAP[key];
+      const bt = (r.bill_type || "TOU").toUpperCase();
+      return bt === type ? fmt(r[field]) : blank;
+    }
     return fmt(r[key]);
   }
 
