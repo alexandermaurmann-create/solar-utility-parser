@@ -258,38 +258,96 @@ def enhance_image(img):
     return img
 
 
+def _sniff_file_kind(file_path):
+    """Identify a file by its MAGIC BYTES, not its extension (uploads are often
+    mislabeled — a .png that's really a HEIC photo, a renamed PDF, etc.).
+    Returns one of: 'pdf', 'image', 'heic', 'unknown'."""
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(32)
+    except Exception:
+        return "unknown"
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image"
+    if head[:3] == b"\xff\xd8\xff":                      # JPEG
+        return "image"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image"
+    if head[:2] == b"BM":                                # BMP
+        return "image"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):             # TIFF
+        return "image"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image"
+    if head[4:8] == b"ftyp":                             # ISO-BMFF: HEIC/HEIF/AVIF
+        return "heic"
+    return "unknown"
+
+
+def _render_one(original):
+    """Shared: from a PIL page/image, return (original_rgb, enhanced_b64)."""
+    original = original.convert("RGB")
+    enhanced = enhance_image(original.copy())
+    buf = io.BytesIO()
+    enhanced.save(buf, format="PNG")
+    b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    return original, b64
+
+
 def file_to_images(file_path):
     """
-    Convert a PDF or PNG to (pil_images, b64_strings).
+    Convert a PDF or image (PNG/JPEG/HEIC/…) to (pil_images, b64_strings).
     pil_images = original PIL images (for pixel analysis).
     b64_strings = enhanced base64 strings (for Claude OCR).
+    Detection is by file content, so a mislabeled extension still works; an
+    unreadable file raises a clear ValueError shown to the user.
     """
     pil_images = []
     b64_strings = []
+    name = os.path.basename(file_path).split("_", 1)[-1]   # strip the uuid prefix
+    kind = _sniff_file_kind(file_path)
 
-    if file_path.lower().endswith(".png"):
-        original = Image.open(file_path).convert("RGB")
-        enhanced = enhance_image(original.copy())
-        buf = io.BytesIO()
-        enhanced.save(buf, format="PNG")
-        pil_images.append(original)
-        b64_strings.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
-    else:
+    if kind == "pdf":
         # 150 DPI keeps plenty of detail for both Claude OCR (which downsamples to
         # ~1568px anyway) and pixel bar analysis, while using ~1/4 the memory of
         # 300 DPI — the 300 DPI render was OOM-killing the 512MB Render instance.
         pages = convert_from_path(file_path, dpi=150)
         for page in pages:
-            original = page.convert("RGB")
-            enhanced = enhance_image(original.copy())
-            buf = io.BytesIO()
-            enhanced.save(buf, format="PNG")
+            original, b64 = _render_one(page)
             pil_images.append(original)
-            b64_strings.append(base64.standard_b64encode(buf.getvalue()).decode("utf-8"))
-            del enhanced, buf          # free the enhanced copy + PNG buffer promptly
+            b64_strings.append(b64)
         del pages
+        return pil_images, b64_strings
 
-    return pil_images, b64_strings
+    if kind == "heic":
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except Exception:
+            raise ValueError(
+                f"'{name}' looks like a HEIC/HEIF image (common from iPhone or Mac "
+                "screenshots). Please re-save or export it as PNG or JPEG and upload again."
+            )
+
+    if kind in ("image", "heic"):
+        try:
+            with Image.open(file_path) as im:
+                original, b64 = _render_one(im)
+        except Exception:
+            raise ValueError(
+                f"Couldn't read '{name}' as an image. The file may be corrupted or in an "
+                "unsupported format — please re-save it as PNG or JPEG and try again."
+            )
+        pil_images.append(original)
+        b64_strings.append(b64)
+        return pil_images, b64_strings
+
+    raise ValueError(
+        f"'{name}' isn't a readable PDF or image. Please upload a PDF, PNG, or JPEG "
+        "(if it's a HEIC photo or a screenshot, export it as PNG first)."
+    )
 
 
 def pixel_extract_bars(pil_image, meta):
