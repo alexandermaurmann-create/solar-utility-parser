@@ -134,6 +134,17 @@ HISTORY_TABLE_BOXES = {
     "toronto hydro": {"top": 0.0, "bottom": 0.42, "left": 0.55, "right": 1.0},
 }
 
+CHART_BARS_PROMPT = """This bill has a monthly electricity-usage BAR chart with NO numbers printed on the bars. Estimate each bar's kWh by reading its height against the y-axis gridlines.
+
+There are exactly {n} bars. Read them LEFT TO RIGHT (oldest month first). The y-axis goes up to about {ymax} kWh, with labeled gridlines at: {gridlines}.
+
+Return ONLY this JSON, no markdown, no other text:
+{{"bars": [list of exactly {n} numbers]}}
+
+- Each number is that bar's kWh, judged against the gridlines, to the nearest ~25.
+- Bars differ in height — do NOT just repeat one round number; read each one.
+"""
+
 CHART_META_PROMPT = """Analyze the usage history bar chart in this utility bill image.
 
 Return ONLY this JSON — no markdown, no extra text:
@@ -1659,6 +1670,32 @@ def extract_with_claude(images_b64, pil_images=None):
     )
     data = clean_json(response1.content[0].text)
 
+    # No-printed-number bar chart. Dedicated extractors (stacked/dailyavg/dualbar) are
+    # self-calibrated and reliable — keep them. But the GENERIC pixel path
+    # (extractor=None) is brittle for these charts: across runs it picks the wrong
+    # page, locks onto stray colors (e.g. the charges table's coloured rows),
+    # mis-groups bars, falls back to equal spacing, and clamps tall bars to the
+    # ceiling — producing wildly different (and wrong) values each run. A vision read
+    # of the bars against the gridlines is far more stable, so make it the PRIMARY
+    # method whenever no dedicated extractor ran. Fall back to whatever pixel produced
+    # (with ambiguous labels fixed) only if the vision read fails.
+    if chart_meta.get("has_bar_chart") and not _has_printed:
+        used_dedicated = chart_via_total   # set only by stacked/dailyavg/dualbar above
+        if not used_dedicated:
+            vh = vision_bar_history(client, image_content, chart_meta,
+                                    data.get("billing_period_end"), data.get("total_kwh"))
+            if vh:
+                print(f"[vision-bars] using vision read ({len(vh)} bars) "
+                      f"instead of brittle generic pixel extraction")
+                pixel_history = vh
+                chart_via_total = True   # newest anchored to bill total
+            else:
+                remap_history_labels(pixel_history, chart_meta,
+                                     data.get("billing_period_end"))
+        else:
+            remap_history_labels(pixel_history, chart_meta,
+                                 data.get("billing_period_end"))
+
     # Printed-number history: the kWh values are printed as text (ground truth), but
     # a single read occasionally digit-slips. Re-transcribe and majority-vote the
     # history so those slips can't reach the table. Pixel/estimated charts skip this
@@ -1864,6 +1901,140 @@ def extract_with_claude(images_b64, pil_images=None):
     }
 
     return verified
+
+
+_LETTER_MONTHS = {"J": [1, 6, 7], "F": [2], "M": [3, 5], "A": [4, 8],
+                  "S": [9], "O": [10], "N": [11], "D": [12]}
+
+
+def disambiguate_month_labels(labels, end_date_str):
+    """Turn ambiguous single-letter chart labels (e.g. 'J25','A25','S25','N25')
+    into real months, RESPECTING GAPS. Single letters are ambiguous (J=Jan/Jun/Jul,
+    M=Mar/May, A=Apr/Aug). We anchor the rightmost bar to the billing month and walk
+    right→left using ONLY each label's letter, requiring a strictly-decreasing month
+    sequence. A skipped month (e.g. no October bar -> letters jump S,N) falls out as a
+    gap. Label YEARS are ignored when a billing date is available, so a typo'd year
+    (e.g. 'J28' for the current bar) can't corrupt the result.
+    Returns ['01 MMM YY', ...] oldest-first, or None if the labels can't be resolved."""
+    if not labels:
+        return None
+    letters = []
+    for lab in labels:
+        ml = re.search(r"[A-Za-z]", str(lab))
+        if not ml or ml.group(0).upper() not in _LETTER_MONTHS:
+            return None
+        letters.append(ml.group(0).upper())
+
+    try:
+        dt = datetime.strptime(str(end_date_str).strip(), "%m/%d/%Y")
+        by, bm = dt.year, dt.month
+    except Exception:
+        return None   # no anchor -> caller falls back to months_ending_at
+
+    def _latest_le(L, y, m):                    # latest (year,month) <= (y,m), letter L
+        same = [mm for mm in _LETTER_MONTHS[L] if mm <= m]
+        return (y, max(same)) if same else (y - 1, max(_LETTER_MONTHS[L]))
+
+    def _latest_lt(L, y, m):                    # latest (year,month) <  (y,m), letter L
+        same = [mm for mm in _LETTER_MONTHS[L] if mm < m]
+        return (y, max(same)) if same else (y - 1, max(_LETTER_MONTHS[L]))
+
+    n = len(letters)
+    months = [None] * n
+    months[-1] = _latest_le(letters[-1], by, bm)     # rightmost = current billing month
+    for i in range(n - 2, -1, -1):
+        ny, nm = months[i + 1]
+        months[i] = _latest_lt(letters[i], ny, nm)
+    return [f"01 {MONTH_ABBR[m - 1].upper()} {str(y)[-2:]}" for (y, m) in months]
+
+
+def months_ending_at(end_date_str, n):
+    """Return n consecutive month labels '01 MMM YY' (oldest first) ending at the
+    month of end_date_str ('MM/DD/YYYY'). Used to reconstruct a usage-history
+    chart's months deterministically when its x-axis labels are ambiguous (e.g.
+    single-letter 'J25' that can't be parsed). Returns None if the date won't parse."""
+    try:
+        dt = datetime.strptime(str(end_date_str).strip(), "%m/%d/%Y")
+    except Exception:
+        return None
+    y, m = dt.year, dt.month - 1            # m is 0-based
+    out = []
+    for _ in range(n):
+        out.append((y, m))
+        m -= 1
+        if m < 0:
+            m, y = 11, y - 1
+    out.reverse()
+    return [f"01 {MONTH_ABBR[mm].upper()} {str(yy)[-2:]}" for yy, mm in out]
+
+
+def vision_bar_history(client, image_content, chart_meta, billing_period_end, current_total):
+    """Fallback for monthly bar charts with NO printed numbers when pixel extraction
+    is unreliable: ask the model to read each bar against the gridlines, and assign
+    the bars to consecutive months ending at the billing month (robust to ambiguous
+    single-letter x-axis labels). Returns [{date,kwh}] oldest-first, or None."""
+    labels = chart_meta.get("month_labels") or []
+    n = chart_meta.get("bar_count") or len(labels)
+    if not n or n < 2:
+        return None
+    # Prefer the chart's own labels (disambiguated, gap-aware); only assume a clean
+    # consecutive run when the labels can't be resolved.
+    months = None
+    if len(labels) == n:
+        months = disambiguate_month_labels(labels, billing_period_end)
+        if months:
+            print(f"[vision-bars] months from labels (gap-aware): "
+                  f"{months[0]}..{months[-1]}")
+    if not months:
+        months = months_ending_at(billing_period_end, n)
+    if not months:
+        print("[vision-bars] no billing_period_end to anchor months — skipping")
+        return None
+    prompt = CHART_BARS_PROMPT.format(
+        n=n, ymax=chart_meta.get("y_axis_max"),
+        gridlines=chart_meta.get("y_axis_gridlines"))
+    try:
+        resp = client.messages.create(
+            model=EXTRACT_MODEL, max_tokens=600,
+            messages=[{"role": "user",
+                       "content": image_content + [{"type": "text", "text": prompt}]}])
+        obj = clean_json(resp.content[0].text)
+        bars = obj.get("bars") if isinstance(obj, dict) else None
+        if not isinstance(bars, list) or len(bars) != n:
+            print(f"[vision-bars] got {len(bars) if isinstance(bars, list) else None} "
+                  f"values, need {n} — skipping")
+            return None
+        vals = [int(round(float(b))) for b in bars]
+    except Exception as e:
+        print(f"[vision-bars] failed: {e}")
+        return None
+    # Anchor the newest bar to the bill's current-period total (read from the
+    # charges/meter section, far more reliable than reading the bar).
+    if isinstance(current_total, (int, float)) and vals:
+        vals[-1] = int(round(current_total))
+    print(f"[vision-bars] read {n} bars, months {months[0]}..{months[-1]}")
+    return [{"date": months[i], "kwh": vals[i]} for i in range(n)]
+
+
+def remap_history_labels(history, chart_meta, end_date_str):
+    """If a pixel-extracted history's dates don't parse (ambiguous single-letter
+    labels like '01 J25', or a typo'd '01 J28'), re-derive the months from the chart
+    labels (gap-aware) and apply them positionally. Mutates history in place; no-op
+    if the dates already parse."""
+    if not history:
+        return
+    if not any(parse_history_date(e.get("date", ""))[0] is None for e in history):
+        return
+    labels = chart_meta.get("month_labels") or []
+    months = (disambiguate_month_labels(labels, end_date_str)
+              if len(labels) == len(history) else None)
+    if not months:
+        months = months_ending_at(end_date_str, len(history))
+    if months:
+        for e, mlab in zip(history, months):
+            e["date"] = mlab
+        print(f"[pixel] remapped {len(history)} ambiguous labels -> "
+              f"{months[0]}..{months[-1]}")
 
 
 def parse_history_date(date_str):
