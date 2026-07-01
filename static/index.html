@@ -60,34 +60,6 @@
     }
     .step-ico svg { width: 17px; height: 17px; }
 
-    /* Confidence */
-    .conf-banner {
-      max-width: 640px;
-      margin: 0 auto 1.75rem;
-      display: flex; flex-direction: column; align-items: center; gap: 0.6rem;
-      text-align: center;
-    }
-    .conf-pill {
-      display: inline-flex; align-items: center; gap: 0.45rem;
-      padding: 0.45rem 1.1rem; border-radius: 999px;
-      font-weight: 700; font-size: 0.98rem;
-    }
-    .conf-pill .lbl { font-weight: 600; opacity: 0.9; }
-    .conf-reasons {
-      list-style: none; padding: 0; margin: 0;
-      font-size: 0.82rem; color: var(--muted); line-height: 1.5;
-    }
-    .conf-note { font-size: 0.74rem; color: #9aa5b1; }
-    .conf-tag {
-      display: inline-block; min-width: 38px; text-align: center;
-      padding: 0.12rem 0.4rem; border-radius: 6px;
-      font-size: 0.72rem; font-weight: 700;
-    }
-    .conf-high   { background: #e6f6ea; color: #1f7a37; }
-    .conf-medium { background: #fdf3e0; color: #9a6a12; }
-    .conf-review { background: #fdeaea; color: #b42d2d; }
-    tr.row-review { background: #fdeef0 !important; }
-
     .upload-card {
       background: white;
       border-radius: 16px;
@@ -340,11 +312,6 @@
 </div>
 
 <div class="results-section" id="results-section" style="display:none">
-  <div class="conf-banner" id="conf-banner" style="display:none">
-    <div class="conf-pill" id="conf-pill"></div>
-    <ul class="conf-reasons" id="conf-reasons"></ul>
-    <div class="conf-note">Confidence estimate — flags what to double-check, not a guarantee of accuracy.</div>
-  </div>
   <div style="display:flex; gap:1.5rem; align-items:flex-start; flex-wrap:wrap; justify-content:center">
 
     <!-- Detail Table column -->
@@ -377,7 +344,6 @@
             <tr>
               <th>Month</th>
               <th>kWh</th>
-              <th>Confidence</th>
             </tr>
           </thead>
           <tbody id="history-body"></tbody>
@@ -586,26 +552,8 @@
     const historyRow = rows.find(r => r.monthly_history && r.monthly_history.length > 0);
     if (historyRow) renderHistory(historyRow.monthly_history);
 
-    renderConfidence((historyRow || rows[0] || {}).confidence);
-
     document.getElementById("results-section").style.display = "block";
     document.getElementById("results-section").scrollIntoView({ behavior: "smooth" });
-  }
-
-  function confClass(label) {
-    return label === "High" ? "conf-high"
-         : label === "Medium" ? "conf-medium" : "conf-review";
-  }
-
-  function renderConfidence(conf) {
-    const banner = document.getElementById("conf-banner");
-    if (!conf || conf.overall == null) { banner.style.display = "none"; return; }
-    const pill = document.getElementById("conf-pill");
-    pill.className = "conf-pill " + confClass(conf.label);
-    pill.innerHTML = `Confidence: ${conf.overall}% <span class="lbl">· ${conf.label}</span>`;
-    document.getElementById("conf-reasons").innerHTML =
-      (conf.reasons || []).map(r => `<li>${r}</li>`).join("");
-    banner.style.display = "flex";
   }
 
   function renderHistory(history) {
@@ -613,15 +561,11 @@
     let total = 0;
     tbody.innerHTML = history.map(h => {
       total += h.kwh || 0;
-      const tag = h.conf != null
-        ? `<span class="conf-tag ${confClass(h.conf_label)}">${h.conf}%</span>`
-        : '<span class="empty">—</span>';
-      const rowCls = h.conf_label === "Review" ? ' class="row-review"' : "";
-      return `<tr${rowCls}><td>${h.month_abbr}</td><td>${fmt(h.kwh)}</td><td>${tag}</td></tr>`;
+      return `<tr><td>${h.month_abbr}</td><td>${fmt(h.kwh)}</td></tr>`;
     }).join("");
     // Total row
     tbody.innerHTML += `<tr style="font-weight:600;border-top:2px solid #2d3748">
-      <td>Total</td><td>${fmt(total)}</td><td></td>
+      <td>Total</td><td>${fmt(total)}</td>
     </tr>`;
     document.getElementById("history-col").style.display = "block";
   }
@@ -644,7 +588,6 @@
     const rows = [...document.querySelectorAll("#history-body tr")];
     const lines = ["Month\tkWh"];
     rows.forEach(tr => {
-      // Only Month + kWh — leave the Confidence column out of the Excel paste.
       const cells = [...tr.querySelectorAll("td")].slice(0, 2)
         .map(td => td.textContent.trim().replace("—", ""));
       lines.push(cells.join("\t"));
